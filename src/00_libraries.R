@@ -50,5 +50,5 @@ library_load <- function(packages) {
 cat("library를 불러옵니다...\n")
 
 library_load(
-  c("data.table", "here", "stringr", "lubridate", "purrr", "stats")
+  c("data.table", "here", "stringr", "lubridate", "purrr", "stats", "dplyr")
 )

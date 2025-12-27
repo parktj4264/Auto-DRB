@@ -1,0 +1,118 @@
+\\12.81.79.114\v9 ek.
+│  18. Auto DRB.Rproj
+│  main.R
+│  renv.lock
+│  run.R
+│
+├─data
+│      raw.csv
+│      ROOTID.csv
+│
+├─output
+│      result.csv
+│
+├─renv
+│  │  .gitignore
+│  │  activate.R
+│  │  settings.json
+│  │
+│  └─library
+│      └─R-4.1 (생략)
+│
+└─src
+        00_libraries.R
+        00_utils.R
+        01_load.R
+        02_funcs.R
+        03_calc.R
+        04_save.R
+		
+		
+		
+		
+		
+		
+
+_______
+
+
+잠깐 데이터 구조 뭐야!?
+
+1. 일단 ROOTID는 AAA000.00 이런 구조여야함!!  "AAA000" 이부분은 랏을 의미하고 "." 뒤에 숫자는 wf 번호를 의미해
+2. 한 웨이퍼에 칩은 대충 몇개로 할까? 대충 300개 어때 / 그리고 wf는 한 30개로할까?
+3. 그리고 X열 Y열 Chip열 Radius 열도 있어야해
+4. X열 Y열은 원형이 되도록 정수로 잘 잡아주라
+5. Chip 열은 X_Y 로 하면 됩니다
+6. Radius열은 위치를 -150~150 로 한거야
+7. 그리고 MSR는 MSR000, MSR001 ... 이렇게 하자! 그리고 MSR별로 각각의 group별 특성 잡아줘 오키?
+8. data 폴더에다가 임시.R 만들어서 시뮬 돌리고 csv 저장합시다
+
+일케 가능?
+
+_______
+
+ㅇㅋ 땅땅땅 ✅ 그 스펙으로 results.csv v1.0 확정.
+그리고 MSR 식별도 “실데이터 기준”으로 PARTID 이후 전부가 정답인 걸로 고정하면 깔끔하다.
+
+정리해서 박아두면 이렇게야:
+
+✅ MSR 컬럼 정의 (실데이터 기준)
+
+raw.csv에서 PARTID 컬럼 바로 다음 열부터 끝까지
+→ 전부 MSR로 간주
+
+(보안 때문에 시뮬에서는 MSR000…로 이름만 바꾼 거고, 실제 운영은 이 규칙)
+
+✅ results.csv 컬럼 스펙 (v1.0 “땅땅땅”)
+
+순서도 너가 적은 그대로:
+
+MSR
+
+Shock_up
+
+Shock_down
+
+Wilcox_flag
+
+KS_flag
+
+mean_A
+
+sd_A
+
+mean_B
+
+sd_B
+
+mean_diff
+
+median_diff
+
+각 컬럼 의미(짧게, 회의용 언어)
+
+Shock_up: Ā + sA < B̄ − sB
+
+Shock_down: Ā − sA > B̄ + sB
+
+Wilcox_flag: 칩 풀링 Wilcoxon에서 강한 신호(임계값은 코드에서 고정)
+
+KS_flag: 칩 풀링 KS(너 실무 Radius 축 기준)에서 강한 신호
+
+mean_A/sd_A/mean_B/sd_B: 그룹별 칩 풀링 요약
+
+mean_diff: mean_B − mean_A
+
+median_diff: median_B − median_A
+
+이제 남은 건 딱 2개 “정책”만 코드에서 박으면 완성임:
+
+Wilcox_flag 임계값(예: p < 1e-3 같은 강한 기준)
+
+KS_flag 임계값(동일하게 강한 기준)
+
+다음 턴에서 너가 “ㅇㅋ 임계값 이렇게”만 던져주면, 그 스펙대로 01_load.R / 03_calc.R 깔끔하게 이어서 설계 들어가면 된다
+
+_______
+
+자 이제 run.R 부터 parameter 골라주라고하자
