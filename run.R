@@ -9,28 +9,53 @@ rm(list = ls()); gc(); Sys.setenv(RENV_CONFIG_GITIGNORE_READ = "FALSE"); options
 
 library(here)
 
-
-# READMD ------------------------------------------------------------------
+# README --------------------------------------------------------------
 # /data
-#   └ raw.csv      ← IH 추출 Chip 데이터 넣기
+#   ├ raw.csv      ← IH 추출 Chip 데이터 (칩 레벨)
+#   └ ROOTID.csv   ← ROOTID - GROUP 매핑 (웨이퍼 레벨)
+#
 # /output
-#   ├ output1.csv
-#   └ output2.csv
+#   └ results.csv  ← DRB rev1.0 결과
 
 
-# parameter ---------------------------------------------------------------
+# parameter -----------------------------------------------------------
 # Only edit here!
 
-FILE_NAME_RAW  <- "raw.csv"
-FILE_NAME_META <- "ROOTID.csv"
+# --- input files ---
+FILE_NAME_RAW      <- "raw.csv"
+FILE_NAME_META     <- "ROOTID.csv"
 
-SIGMA_LEVEL    <- 1.0            # Outlier 기준 (1 sigma)
-WILCOX_MU      <- 0
-WAFER_RADIUS   <- 150
+# --- key column names ---
+ROOTID_COL         <- "ROOTID"
+GROUP_COL          <- "GROUP"
+PARTID_COL         <- "PARTID"
+RADIUS_COL         <- "Radius"     # 실무: 좌/우 signed position (-150~150)
 
-ADD_GROUPS     <- c("공정", "CORE")
-GROUP_COLS     <- c("ROOTID", "GROUP", ADD_GROUPS)
+# --- group definition ---
+# 원칙: REF=기준(Old), TARGET=변경(New)
+GROUP_REF_LABEL     <- "A"
+GROUP_TARGET_LABEL  <- "B"
+
+# --- DRB rev1.0 parameters -------------------------------------------
+
+# 1) Sigma_shift (k-sigma rule)
+SIGMA_LEVEL         <- 1.0          # 예: 0.5 / 1.0 / 1.5
+
+# 2) Wilcoxon (distribution shift)
+WILCOX_ALPHA        <- 0.001         # 강한 신호만
+
+# 3) KS (Radius-weighted KS)
+# - ks_flag_radius_weighted() 사용
+KS_ALPHA            <- 0.001         # 강한 신호만
+KS_MIN_N            <- 30           # KS에 들어갈 최소 샘플 수(각 그룹)
+
+# --- output ---
+OUT_DIR             <- "output"
+OUT_FILE_RESULTS    <- "results.csv"
 
 
-# start -------------------------------------------------------------------
+# start ---------------------------------------------------------------
 source(here::here("main.R"), encoding = "UTF-8")
+
+
+
