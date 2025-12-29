@@ -23,19 +23,12 @@ if (!exists("results_dt")) {
     cat(sprintf("WARNING: existing file will be overwritten: %s\n", out_path))
   }
   
-  # [NEW] flag는 CSV에서 1/0으로 저장 (실무 편의)
-  # [FIX] flag는 CSV에서 1/0으로 저장 (TRUE=1, FALSE=0, NA=0)
-  flag_cols <- intersect(c("sigma_up","sigma_down","wilcox_flag","ks_flag"), names(results_dt))
-  if (length(flag_cols) > 0) {
-    for (fc in flag_cols) {
-      results_dt[, (fc) := {
-        v <- as.integer(get(fc))  # TRUE=1, FALSE=0, NA=NA
-        v[is.na(v)] <- 0L         # NA는 0 처리
-        v
-      }]
-    }
+  # [OPTIONAL] direction을 코드로도 남기고 싶으면 추가 (Up=1, Stable=0, Down=-1)
+  # - 기본은 direction 문자열 유지 (엔지니어 가독성)
+  if ("direction" %in% names(results_dt) && !("dir_code" %in% names(results_dt))) {
+    results_dt[, dir_code := fifelse(direction == "Up", 1L,
+                                     fifelse(direction == "Down", -1L, 0L))]
   }
-  
   
   # fwrite (빠르고 안전)
   tryCatch({
@@ -50,15 +43,33 @@ if (!exists("results_dt")) {
   cat(sprintf(">> rows: %s | cols: %d\n",
               format(nrow(results_dt), big.mark=","), ncol(results_dt)))
   
-  # flag 요약 (0/1이면 sum이 곧 count)
-  if (all(c("sigma_up","sigma_down","wilcox_flag","ks_flag") %in% names(results_dt))) {
-    cat(sprintf(">> flags: sigma_up=%d, sigma_down=%d, wilcox=%d, ks=%d\n",
-                sum(results_dt$sigma_up, na.rm=TRUE),
-                sum(results_dt$sigma_down, na.rm=TRUE),
-                sum(results_dt$wilcox_flag, na.rm=TRUE),
-                sum(results_dt$ks_flag, na.rm=TRUE)))
+  # direction 요약
+  if ("direction" %in% names(results_dt)) {
+    cat(">> direction summary:\n")
+    print(table(results_dt$direction, useNA = "ifany"))
   }
+  
+  # # score 요약 (엔지니어가 바로 감 잡음)
+  # score_cols <- intersect(c("sigma_score", "cliffs_delta", "ws_spatial"), names(results_dt))
+  # if (length(score_cols) > 0) {
+  #   cat(">> score summary (quantiles):\n")
+  #   for (sc in score_cols) {
+  #     v <- results_dt[[sc]]
+  #     v <- v[is.finite(v)]
+  #     if (length(v) == 0) next
+  #     qs <- stats::quantile(v, probs = c(0, 0.25, 0.5, 0.75, 0.95, 1), na.rm = TRUE)
+  #     cat(sprintf(" - %s: ", sc))
+  #     print(qs)
+  #   }
+  # }
+  
+  # TOP10 예시 출력 (abs(sigma_score) 기준으로 이미 정렬돼있다는 가정)
+  # if ("sigma_score" %in% names(results_dt)) {
+  #   cat(">> TOP 10 by |sigma_score| (preview):\n")
+  #   cols_show <- intersect(c("msr","direction","sigma_score","cliffs_delta","ws_spatial",
+  #                            "mean_ref","sd_ref","mean_target","sd_target"), names(results_dt))
+  #   print(head(results_dt[, ..cols_show], 10))
+  # }
 }
 
 cat("Done (Save)\n")
-

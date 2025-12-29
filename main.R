@@ -1,4 +1,4 @@
-# main.R 
+# main.R -------------------------------------------------------------------
 
 # library load and setting --------------------------------------------
 library(here)
@@ -8,14 +8,15 @@ cat("==============================================\n")
 
 # Basic run info -------------------------------------------------------
 cat("----------------------------------------------\n")
-cat("DRB rev1.0 start\n")
-cat(sprintf("- raw file   : %s\n", FILE_NAME_RAW))
-cat(sprintf("- meta file  : %s\n", FILE_NAME_META))
-cat(sprintf("- group (REF/TARGET) : %s / %s\n", GROUP_REF_LABEL, GROUP_TARGET_LABEL))
-cat(sprintf("- sigma level        : %s\n", SIGMA_LEVEL))
-cat(sprintf("- wilcox alpha       : %s\n", WILCOX_ALPHA))
-cat(sprintf("- ks alpha           : %s\n", KS_ALPHA))
-cat(sprintf("- output file        : %s\n", OUT_FILE_RESULTS))
+cat("DRB rev1 start\n")
+cat(sprintf("- raw file            : %s\n", FILE_NAME_RAW))
+cat(sprintf("- meta file           : %s\n", FILE_NAME_META))
+cat(sprintf("- group (REF/TARGET)  : %s / %s\n", GROUP_REF_LABEL, GROUP_TARGET_LABEL))
+cat(sprintf("- sigma level         : %s\n", SIGMA_LEVEL))
+cat(sprintf("- ws bins (K)         : %s\n", WS_N_BINS))
+cat(sprintf("- ws bin method       : %s\n", WS_BIN_METHOD))
+cat(sprintf("- ws min n / bin      : %s\n", WS_MIN_N_PER_BIN))
+cat(sprintf("- output              : %s/%s\n", OUT_DIR, OUT_FILE_RESULTS))
 cat("----------------------------------------------\n")
 
 # time start -----------------------------------------------------------
@@ -34,5 +35,5 @@ mins     <- floor(elapsed / 60)
 secs     <- round(elapsed %% 60)
 
 cat(sprintf("\nElapsed time: %d min %d sec\n", mins, secs))
-cat("DRB rev1.0 done\n")
+cat("DRB rev1 done\n")
 cat("==============================================\n")

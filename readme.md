@@ -43,20 +43,20 @@ Reference 공정의 산포를 기준으로 Target 공정의 평균이 얼마나 
 
 Radius 축(Shot map trend)에 따른 공간적 프로파일의 **물리적 괴리도(Physical Discrepancy)**를 측정한다.
 
-* **구현 (Implementation)**
-    1. Radius를 $K$개의 구간(Bin)으로 분할하여 국소 평균(Local Mean) 벡터를 생성한다.
-    2. Ref와 Target 프로파일 간의 **$L_1$ 거리 (Mean Absolute Difference)**를 계산한다.
-    > *Note: 반도체 공정 특성상 칩의 수평 이동(Transport)보다는 **위치별 불량 심도(Vertical Gap)**가 중요하므로, 연산 효율과 공정 적합성을 고려하여 Binning $L_1$ 방식으로 형상 차이를 근사함.*
+-   **구현 (Implementation)**
 
-* **수식**
-  $$
-  \text{score} = \frac{1}{K} \sum_{i=1}^{K} \left| \text{Profile}_{ref}(i) - \text{Profile}_{target}(i) \right|
-  $$
+    1.  Radius를 $K$개의 구간(Bin)으로 분할하여 국소 평균(Local Mean) 벡터를 생성한다.
+    2.  Ref와 Target 프로파일 간의 $L_1$ 거리 (Mean Absolute Difference)를 계산한다. \> *Note: 반도체 공정 특성상 칩의 수평 이동(Transport)보다는 **위치별 불량 심도(Vertical Gap)**가 중요하므로, 연산 효율과 공정 적합성을 고려하여 Binning* $L_1$ 방식으로 형상 차이를 근사함.
 
-* **해석**: **"공간적 트렌드(Shape)가 물리적으로 얼마나 망가졌는가?"**
-    * 값이 **0에 가까울수록**: 두 공정의 Shot Map 형태가 완벽하게 일치함.
-    * 값이 **클수록**: Center/Edge 경향성이나 국소적인 튐(Spike) 현상이 발생하여 모양이 달라짐.
-    
+-   **수식** $$
+    \text{score} = \frac{1}{K} \sum_{i=1}^{K} \left| \text{Profile}_{ref}(i) - \text{Profile}_{target}(i) \right|
+    $$
+
+-   **해석**: **"공간적 트렌드(Shape)가 물리적으로 얼마나 망가졌는가?"**
+
+    -   값이 **0에 가까울수록**: 두 공정의 Shot Map 형태가 완벽하게 일치함.
+    -   값이 **클수록**: Center/Edge 경향성이나 국소적인 튐(Spike) 현상이 발생하여 모양이 달라짐.
+
 ### 4) Direction Flag: `direction` (Up/Down/Stable)
 
 엔지니어의 직관적 판단을 돕기 위해 변화의 방향을 명시한다. \* **파라미터**: `DIR_SIGMA_THRESHOLD` (예: 1.0, 0.5 등 사용자가 민감도 조절 가능) \* **로직**: \* `sigma_score` $\ge$ `DIR_SIGMA_THRESHOLD` $\rightarrow$ **"Up"** \* `sigma_score` $\le$ -`DIR_SIGMA_THRESHOLD` $\rightarrow$ **"Down"** \* 그 외 $\rightarrow$ **"Stable"**

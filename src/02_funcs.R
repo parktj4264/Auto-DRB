@@ -1,11 +1,16 @@
 # 02_funcs.R
-
 # src/02_funcs.R ------------------------------------------------------------
 
 # 목적:
 # - 03_calc.R에서 MSR 루프를 돌릴 때 사용할 함수 모음
 # - REF/TARGET 비교 기준은 run.R의 GROUP_REF_LABEL / GROUP_TARGET_LABEL
-# - 결과는 results.csv v1.0 (snake_case, ref/target 표기) 기준
+# - 결과는 results.csv (snake_case, ref/target 표기) 기준
+#
+# DRB rev1 (Final):
+# - sigma_score      : Glass's delta = (mean_target - mean_ref) / sd_ref
+# - cliffs_delta     : distribution dominance (Wilcoxon W -> U -> delta)
+# - ws_spatial       : Radius profile L1 deviation (bin mean profile gap)
+# - direction        : Up/Down/Stable (threshold = SIGMA_LEVEL)
 
 # -------------------------------------------------------------------------
 # 0) Small helpers
@@ -68,121 +73,162 @@ calc_summary_ref_target <- function(x_ref, x_target) {
 }
 
 # -------------------------------------------------------------------------
-# 2) Sigma_shift flags (k-sigma rule)
+# 2) sigma_score (Glass's delta)
+#    score = (mean_target - mean_ref) / sd_ref
 # -------------------------------------------------------------------------
 
-sigma_shift_flags <- function(mean_ref, sd_ref, mean_target, sd_target, sigma_level) {
-  # 결측/비정상 상황은 FALSE로 처리 (실무: 튼튼하게)
-  if (!is.finite(mean_ref) || !is.finite(mean_target) || !is.finite(sigma_level)) {
-    return(list(sigma_up = FALSE, sigma_down = FALSE))
-  }
-  if (!is.finite(sd_ref) || !is.finite(sd_target)) {
-    return(list(sigma_up = FALSE, sigma_down = FALSE))
-  }
-  
-  k <- sigma_level
-  
-  sigma_up   <- (mean_ref + k * sd_ref) < (mean_target - k * sd_target)
-  sigma_down <- (mean_ref - k * sd_ref) > (mean_target + k * sd_target)
-  
-  list(
-    sigma_up   = isTRUE(sigma_up),
-    sigma_down = isTRUE(sigma_down)
-  )
+calc_sigma_score <- function(mean_ref, sd_ref, mean_target) {
+  if (!is.finite(mean_ref) || !is.finite(mean_target) || !is.finite(sd_ref)) return(NA_real_)
+  if (sd_ref <= 0) return(NA_real_)
+  (mean_target - mean_ref) / sd_ref
+}
+
+direction_from_sigma <- function(sigma_score, sigma_level) {
+  # sigma_level = SIGMA_LEVEL (예: 0.5 / 1.0 / 1.5)
+  if (!is.finite(sigma_score) || !is.finite(sigma_level)) return("Stable")
+  if (sigma_score >= sigma_level) return("Up")
+  if (sigma_score <= -sigma_level) return("Down")
+  "Stable"
 }
 
 # -------------------------------------------------------------------------
-# 3) Wilcoxon flag (chip pooling)
+# 3) cliffs_delta (Stochastic Dominance)
+#    - Wilcoxon rank-sum의 W 통계량으로부터 U를 복원
+#    - delta = 2U/(n_t*n_r) - 1  (Target > Ref 우세면 +)
+#
+#    주의:
+#    - R의 wilcox.test(x, y)$statistic 은 "첫 번째 샘플 x"의 rank sum(W)임.
+#    - 따라서 Target 우세를 +로 만들려면 wilcox.test(x_target, x_ref)로 호출.
 # -------------------------------------------------------------------------
 
-wilcox_flag <- function(x_ref, x_target, alpha) {
-  # NA 제거 후 표본수 너무 작으면 판단 불가 -> FALSE
-  x_ref2    <- x_ref[is.finite(x_ref)]
-  x_target2 <- x_target[is.finite(x_target)]
+calc_cliffs_delta <- function(x_ref, x_target) {
+  xr <- x_ref[is.finite(x_ref)]
+  xt <- x_target[is.finite(x_target)]
   
-  if (length(x_ref2) < 2 || length(x_target2) < 2) {
-    return(list(flag = FALSE, p_value = NA_real_))
-  }
+  n_r <- length(xr)
+  n_t <- length(xt)
   
-  p <- tryCatch({
-    stats::wilcox.test(x_ref2, x_target2, alternative = "two.sided", exact = FALSE)$p.value
+  if (n_r < 1 || n_t < 1) return(NA_real_)
+  
+  W <- tryCatch({
+    as.numeric(stats::wilcox.test(xt, xr, alternative = "two.sided", exact = FALSE)$statistic)
   }, error = function(e) NA_real_)
   
-  list(
-    flag    = is.finite(p) && (p < alpha),
-    p_value = p
-  )
+  if (!is.finite(W)) return(NA_real_)
+  
+  # U = W - n_t(n_t+1)/2
+  U <- W - (n_t * (n_t + 1)) / 2
+  
+  denom <- n_t * n_r
+  if (denom <= 0) return(NA_real_)
+  
+  delta <- (2 * U / denom) - 1
+  as.numeric(delta)
 }
 
 # -------------------------------------------------------------------------
-# 4) KS flag (Radius-weighted KS)
-#    - 공간(좌/우 + 거리) 정보를 값에 섞어서 1D 분포로 만든 뒤 KS 수행
-#    - z = x * (radius / max_abs_radius)
+# 4) ws_spatial (Radius profile L1 deviation)
+#    - Radius를 K bins로 나눔
+#    - 각 bin에서 local mean profile 생성
+#    - score = mean( abs(profile_ref - profile_target) ) over valid bins
+#
+#    params:
+#      K             : WS_N_BINS
+#      method        : WS_BIN_METHOD ("equal_width" or "quantile")
+#      min_n_per_bin : WS_MIN_N_PER_BIN (각 그룹 bin 최소 표본)
 # -------------------------------------------------------------------------
 
-make_radius_weighted_values <- function(radius, values, eps = 1e-12) {
-  r <- safe_as_numeric(radius)
-  x <- safe_as_numeric(values)
+make_radius_bins <- function(r_all, K, method = "equal_width") {
+  r_all <- r_all[is.finite(r_all)]
+  if (length(r_all) == 0) return(NULL)
   
-  ok <- is.finite(r) & is.finite(x)
-  r <- r[ok]
-  x <- x[ok]
+  if (!is.finite(K) || K < 2) return(NULL)
   
-  if (length(r) == 0) return(numeric(0))
+  method <- tolower(method)
   
-  max_abs <- max(abs(r))
-  if (!is.finite(max_abs) || max_abs < eps) return(numeric(0))
-  
-  # 위치 정보를 연속 가중치로 섞기: 좌(-) / 우(+) + 거리
-  z <- x * (r / max_abs)
-  z[is.finite(z)]
-}
-
-ks_flag_radius_weighted <- function(radius_ref, x_ref, radius_target, x_target,
-                                    alpha, min_n = 30) {
-  
-  z_ref    <- make_radius_weighted_values(radius_ref, x_ref)
-  z_target <- make_radius_weighted_values(radius_target, x_target)
-  
-  # 표본이 너무 작으면 안정적으로 FALSE 처리
-  if (length(z_ref) < min_n || length(z_target) < min_n) {
-    return(list(flag = FALSE, p_value = NA_real_, n_ref = length(z_ref), n_target = length(z_target)))
+  if (method == "quantile") {
+    probs <- seq(0, 1, length.out = K + 1)
+    brks <- as.numeric(stats::quantile(r_all, probs = probs, na.rm = TRUE, type = 7))
+    brks <- unique(brks)
+    if (length(brks) < 3) return(NULL)
+    return(brks)
   }
   
-  p <- tryCatch({
-    stats::ks.test(z_ref, z_target, alternative = "two.sided")$p.value
-  }, error = function(e) NA_real_)
+  # default: equal_width
+  r_min <- min(r_all)
+  r_max <- max(r_all)
+  if (!is.finite(r_min) || !is.finite(r_max) || r_min == r_max) return(NULL)
   
-  list(
-    flag     = is.finite(p) && (p < alpha),
-    p_value  = p,
-    n_ref    = length(z_ref),
-    n_target = length(z_target)
-  )
+  seq(r_min, r_max, length.out = K + 1)
 }
 
+calc_ws_spatial <- function(radius_ref, x_ref, radius_target, x_target,
+                            K = 30, method = "equal_width", min_n_per_bin = 10) {
+  
+  rr <- safe_as_numeric(radius_ref)
+  xr <- safe_as_numeric(x_ref)
+  rt <- safe_as_numeric(radius_target)
+  xt <- safe_as_numeric(x_target)
+  
+  ok_r <- is.finite(rr) & is.finite(xr)
+  ok_t <- is.finite(rt) & is.finite(xt)
+  
+  rr <- rr[ok_r]; xr <- xr[ok_r]
+  rt <- rt[ok_t]; xt <- xt[ok_t]
+  
+  if (length(rr) == 0 || length(rt) == 0) return(NA_real_)
+  
+  brks <- make_radius_bins(c(rr, rt), K = K, method = method)
+  if (is.null(brks)) return(NA_real_)
+  
+  # 동일 breaks로 bin id 부여
+  bin_r <- cut(rr, breaks = brks, include.lowest = TRUE, right = TRUE, labels = FALSE)
+  bin_t <- cut(rt, breaks = brks, include.lowest = TRUE, right = TRUE, labels = FALSE)
+  
+  # bin별 mean + n
+  dt_r <- data.table::data.table(bin = bin_r, x = xr)[is.finite(bin)]
+  dt_t <- data.table::data.table(bin = bin_t, x = xt)[is.finite(bin)]
+  
+  prof_r <- dt_r[, .(mean_ref_bin = safe_mean(x), n_ref_bin = .N), by = bin]
+  prof_t <- dt_t[, .(mean_target_bin = safe_mean(x), n_target_bin = .N), by = bin]
+  
+  prof <- merge(prof_r, prof_t, by = "bin", all = TRUE)
+  
+  # 결측/표본 부족 bin 제거 (둘 중 하나라도 부족하면 shape 비교 의미 없음)
+  min_n <- as.integer(min_n_per_bin)
+  if (!is.finite(min_n) || min_n < 1) min_n <- 1L
+  
+  prof <- prof[
+    is.finite(mean_ref_bin) & is.finite(mean_target_bin) &
+      (n_ref_bin >= min_n) & (n_target_bin >= min_n)
+  ]
+  
+  if (nrow(prof) == 0) return(NA_real_)
+  
+  # L1 distance averaged over bins
+  mean(abs(prof$mean_target_bin - prof$mean_ref_bin), na.rm = TRUE)
+}
 
 # -------------------------------------------------------------------------
-# 5) Build result row (results.csv v1.0)
+# 5) Build result row (results.csv rev1 Final)
 # -------------------------------------------------------------------------
 
 make_result_row <- function(msr_name,
-                            sigma_up, sigma_down,
-                            wilcox_flag, ks_flag,
-                            mean_ref, sd_ref, mean_target, sd_target,
-                            mean_diff, median_diff) {
+                            direction,
+                            sigma_score,
+                            cliffs_delta,
+                            ws_spatial,
+                            mean_ref, sd_ref, mean_target, sd_target) {
   
   data.table::data.table(
-    msr         = msr_name,
-    sigma_up    = as.logical(sigma_up),
-    sigma_down  = as.logical(sigma_down),
-    wilcox_flag = as.logical(wilcox_flag),
-    ks_flag     = as.logical(ks_flag),
+    msr         = as.character(msr_name),
+    direction   = as.character(direction),
+    sigma_score = as.numeric(sigma_score),
+    cliffs_delta= as.numeric(cliffs_delta),
+    ws_spatial  = as.numeric(ws_spatial),
     mean_ref    = as.numeric(mean_ref),
     sd_ref      = as.numeric(sd_ref),
     mean_target = as.numeric(mean_target),
-    sd_target   = as.numeric(sd_target),
-    mean_diff   = as.numeric(mean_diff),
-    median_diff = as.numeric(median_diff)
+    sd_target   = as.numeric(sd_target)
   )
 }

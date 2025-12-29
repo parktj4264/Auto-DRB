@@ -36,18 +36,19 @@ RADIUS_COL         <- "Radius"     # 실무: 좌/우 signed position (-150~150)
 GROUP_REF_LABEL     <- "A"
 GROUP_TARGET_LABEL  <- "B"
 
-# --- DRB rev1.0 parameters -------------------------------------------
+# --- DRB rev1 parameters --------------------------------------------
 
-# 1) Sigma_shift (k-sigma rule)
-SIGMA_LEVEL         <- 1.0          # 예: 0.5 / 1.0 / 1.5
+# 1) direction 판정용 threshold (k-sigma)
+# - sigma_score = (mean_target - mean_ref) / sd_ref
+# - direction: Up/Down/Stable을 나누는 기준
+SIGMA_LEVEL         <- 0.3          # 예: 0.5 / 1.0 / 1.5
 
-# 2) Wilcoxon (distribution shift)
-WILCOX_ALPHA        <- 0.001         # 강한 신호만
+# 2) spatial score (ws_spatial) 계산용 binning
+WS_N_BINS           <- 30           # Radius를 몇 구간으로 나눌지 (K)
+WS_BIN_METHOD       <- "equal_width" # "equal_width" or "quantile"
 
-# 3) KS (Radius-weighted KS)
-# - ks_flag_radius_weighted() 사용
-KS_ALPHA            <- 0.001         # 강한 신호만
-KS_MIN_N            <- 30           # KS에 들어갈 최소 샘플 수(각 그룹)
+# (optional) 빈(bin)에 표본이 너무 적으면 해당 bin 제외
+WS_MIN_N_PER_BIN    <- 10
 
 # --- output ---
 OUT_DIR             <- "output"
