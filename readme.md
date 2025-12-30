@@ -96,3 +96,5 @@ Radius 축(Shot map trend)에 따른 공간적 프로파일의 **물리적 괴�
 | **cliffs_delta** | "분포가 얼마나 **한쪽으로 쏠렸나?**" (-1\~1)            |
 | **ws_spatial**   | "맵(Map)의 **생김새가 얼마나 다른가?**"                 |
 | **direction**    | "그래서 **열화(Up/Down)야 개선이야?**"                  |
+
+.
