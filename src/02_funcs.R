@@ -9,7 +9,7 @@
 # DRB rev1 (Final):
 # - sigma_score      : Glass's delta = (mean_target - mean_ref) / sd_ref
 # - cliffs_delta     : distribution dominance (Wilcoxon W -> U -> delta)
-# - ws_spatial       : Radius profile L1 deviation (bin mean profile gap)
+# - spatial_drift    : Wasserstein Distance (Geometry / Optimal Transport)
 # - direction        : Up/Down/Stable (threshold = SIGMA_LEVEL)
 
 # -------------------------------------------------------------------------
@@ -93,31 +93,34 @@ direction_from_sigma <- function(sigma_score, sigma_level) {
 
 # -------------------------------------------------------------------------
 # 3) cliffs_delta (Stochastic Dominance)
-#    - Wilcoxon rank-sum의 W 통계량으로부터 U를 복원
-#    - delta = 2U/(n_t*n_r) - 1  (Target > Ref 우세면 +)
+#    - Mann–Whitney U 기반 Cliff's delta (Target > Ref 우세면 +)
+#    - delta = 2U/(n_t*n_r) - 1
 #
 #    주의:
-#    - R의 wilcox.test(x, y)$statistic 은 "첫 번째 샘플 x"의 rank sum(W)임.
-#    - 따라서 Target 우세를 +로 만들려면 wilcox.test(x_target, x_ref)로 호출.
+#    - R의 wilcox.test(x, y)$statistic 은 이름이 "W"로 나오지만,
+#      2-sample에서는 R 내부 정의상 U(= rank-sum에서 m(m+1)/2 뺀 값)에 해당하는 형태로 반환됨.
+#    - 따라서 여기서는 추가로 m(m+1)/2를 빼지 않는다.
+#    - Target 우세를 +로 만들려면 wilcox.test(x_target, x_ref)로 호출.
 # -------------------------------------------------------------------------
 
 calc_cliffs_delta <- function(x_ref, x_target) {
-  xr <- x_ref[is.finite(x_ref)]
-  xt <- x_target[is.finite(x_target)]
+  xr <- suppressWarnings(as.numeric(x_ref))
+  xt <- suppressWarnings(as.numeric(x_target))
+  
+  xr <- xr[is.finite(xr)]
+  xt <- xt[is.finite(xt)]
   
   n_r <- length(xr)
   n_t <- length(xt)
   
   if (n_r < 1 || n_t < 1) return(NA_real_)
   
-  W <- tryCatch({
+  # R의 "W" (2-sample): 사실상 U 형태(shifted rank-sum)로 리턴되는 값
+  U <- tryCatch({
     as.numeric(stats::wilcox.test(xt, xr, alternative = "two.sided", exact = FALSE)$statistic)
   }, error = function(e) NA_real_)
   
-  if (!is.finite(W)) return(NA_real_)
-  
-  # U = W - n_t(n_t+1)/2
-  U <- W - (n_t * (n_t + 1)) / 2
+  if (!is.finite(U)) return(NA_real_)
   
   denom <- n_t * n_r
   if (denom <= 0) return(NA_real_)
@@ -126,88 +129,122 @@ calc_cliffs_delta <- function(x_ref, x_target) {
   as.numeric(delta)
 }
 
+
 # -------------------------------------------------------------------------
-# 4) ws_spatial (Radius profile L1 deviation)
-#    - Radius를 K bins로 나눔
-#    - 각 bin에서 local mean profile 생성
-#    - score = mean( abs(profile_ref - profile_target) ) over valid bins
+# 4) spatial_drift (Sinkhorn OT on GROUP-averaged wafer maps)
+#    - 목적: REF vs TARGET의 "형상(Shape)" 차이를 물리적 이동 비용으로 정량화
 #
-#    params:
-#      K             : WS_N_BINS
-#      method        : WS_BIN_METHOD ("equal_width" or "quantile")
-#      min_n_per_bin : WS_MIN_N_PER_BIN (각 그룹 bin 최소 표본)
+#    Phase 1) clipping (상위 20%만 남김, 나머지는 0)
+#       f_clip(v) = max(v - tau, 0),  tau = quantile(v, q_clip)
+#
+#    Phase 2) density normalization (총합=1)
+#       sum(w)==0 이면 uniform 분포 할당
+#
+#    Phase 3) Sinkhorn distance (entropic OT)
+#       cost C_ij = ||s_i - t_j||^2  (scaled to avoid numeric underflow)
+#
+#    params (run.R 권장):
+#      q_clip     : OT_Q           (default 0.8)
+#      epsilon    : OT_EPSILON     (default 0.1)  # cost scale 적용 전제
+#      max_iter   : OT_MAX_ITER    (<100)
+#      cost_scale : OT_COST_SCALE  (NULL이면 자동)
+#      tiny       : OT_TINY
 # -------------------------------------------------------------------------
 
-make_radius_bins <- function(r_all, K, method = "equal_width") {
-  r_all <- r_all[is.finite(r_all)]
-  if (length(r_all) == 0) return(NULL)
+clip_relu <- function(v, q = 0.8) {
+  if (length(v) == 0) return(numeric(0))
+  tau <- stats::quantile(v, probs = q, na.rm = TRUE, names = FALSE, type = 7)
+  pmax(v - tau, 0)
+}
+
+normalize_prob <- function(w, tiny = 1e-12) {
+  n <- length(w)
+  if (n == 0) return(numeric(0))
+  s <- sum(w)
+  if (!is.finite(s) || s <= tiny) {
+    return(rep(1 / n, n))
+  }
+  w / s
+}
+
+sinkhorn_cost_rect <- function(p, q, C, epsilon = 0.1, max_iter = 80, tiny = 1e-12) {
+  # p: length n, q: length m, C: n x m
+  K <- exp(-C / epsilon)
+  K[K < tiny] <- tiny
   
-  if (!is.finite(K) || K < 2) return(NULL)
+  u <- rep(1, length(p))
+  v <- rep(1, length(q))
   
-  method <- tolower(method)
-  
-  if (method == "quantile") {
-    probs <- seq(0, 1, length.out = K + 1)
-    brks <- as.numeric(stats::quantile(r_all, probs = probs, na.rm = TRUE, type = 7))
-    brks <- unique(brks)
-    if (length(brks) < 3) return(NULL)
-    return(brks)
+  for (t in seq_len(max_iter)) {
+    Kv <- K %*% v
+    Kv[ Kv < tiny ] <- tiny
+    u <- p / as.numeric(Kv)
+    
+    KTu <- t(K) %*% u
+    KTu[ KTu < tiny ] <- tiny
+    v <- q / as.numeric(KTu)
   }
   
-  # default: equal_width
-  r_min <- min(r_all)
-  r_max <- max(r_all)
-  if (!is.finite(r_min) || !is.finite(r_max) || r_min == r_max) return(NULL)
-  
-  seq(r_min, r_max, length.out = K + 1)
+  # transport plan P_ij = u_i * K_ij * v_j
+  # cost = sum(P * C)
+  P <- (u * (K * rep(v, each = length(u))))
+  sum(P * C)
 }
 
-calc_ws_spatial <- function(radius_ref, x_ref, radius_target, x_target,
-                            K = 30, method = "equal_width", min_n_per_bin = 10) {
+# group-averaged map (칩 좌표별 평균)
+make_group_mean_map <- function(dt, msr_col, group_col, group_label, x_col, y_col) {
+  dt_sub <- dt[get(group_col) == group_label, .(
+    x = suppressWarnings(as.numeric(get(x_col))),
+    y = suppressWarnings(as.numeric(get(y_col))),
+    v = suppressWarnings(as.numeric(get(msr_col)))
+  )]
   
-  rr <- safe_as_numeric(radius_ref)
-  xr <- safe_as_numeric(x_ref)
-  rt <- safe_as_numeric(radius_target)
-  xt <- safe_as_numeric(x_target)
+  dt_sub <- dt_sub[is.finite(x) & is.finite(y) & is.finite(v)]
+  if (nrow(dt_sub) == 0) {
+    return(data.table::data.table(x = numeric(0), y = numeric(0), v = numeric(0)))
+  }
   
-  ok_r <- is.finite(rr) & is.finite(xr)
-  ok_t <- is.finite(rt) & is.finite(xt)
-  
-  rr <- rr[ok_r]; xr <- xr[ok_r]
-  rt <- rt[ok_t]; xt <- xt[ok_t]
-  
-  if (length(rr) == 0 || length(rt) == 0) return(NA_real_)
-  
-  brks <- make_radius_bins(c(rr, rt), K = K, method = method)
-  if (is.null(brks)) return(NA_real_)
-  
-  # 동일 breaks로 bin id 부여
-  bin_r <- cut(rr, breaks = brks, include.lowest = TRUE, right = TRUE, labels = FALSE)
-  bin_t <- cut(rt, breaks = brks, include.lowest = TRUE, right = TRUE, labels = FALSE)
-  
-  # bin별 mean + n
-  dt_r <- data.table::data.table(bin = bin_r, x = xr)[is.finite(bin)]
-  dt_t <- data.table::data.table(bin = bin_t, x = xt)[is.finite(bin)]
-  
-  prof_r <- dt_r[, .(mean_ref_bin = safe_mean(x), n_ref_bin = .N), by = bin]
-  prof_t <- dt_t[, .(mean_target_bin = safe_mean(x), n_target_bin = .N), by = bin]
-  
-  prof <- merge(prof_r, prof_t, by = "bin", all = TRUE)
-  
-  # 결측/표본 부족 bin 제거 (둘 중 하나라도 부족하면 shape 비교 의미 없음)
-  min_n <- as.integer(min_n_per_bin)
-  if (!is.finite(min_n) || min_n < 1) min_n <- 1L
-  
-  prof <- prof[
-    is.finite(mean_ref_bin) & is.finite(mean_target_bin) &
-      (n_ref_bin >= min_n) & (n_target_bin >= min_n)
-  ]
-  
-  if (nrow(prof) == 0) return(NA_real_)
-  
-  # L1 distance averaged over bins
-  mean(abs(prof$mean_target_bin - prof$mean_ref_bin), na.rm = TRUE)
+  # 좌표별 평균 (칩 pooling -> wafer 평균맵 1장)
+  dt_sub[, .(v = mean(v)), by = .(x, y)]
 }
+
+calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
+                                        q_clip = 0.8,
+                                        epsilon = 0.1,
+                                        max_iter = 80,
+                                        cost_scale = NULL,
+                                        tiny = 1e-12) {
+  # map_ref / map_target: data.table(x,y,v)
+  
+  if (nrow(map_ref) == 0 || nrow(map_target) == 0) return(NA_real_)
+  
+  # Phase 1: clipping (각 그룹 내부에서 threshold)
+  w_ref <- clip_relu(map_ref$v, q = q_clip)
+  w_tar <- clip_relu(map_target$v, q = q_clip)
+  
+  # Phase 2: normalize
+  p <- normalize_prob(w_ref, tiny = tiny)
+  q <- normalize_prob(w_tar, tiny = tiny)
+  
+  # support coords
+  Xr <- map_ref$x; Yr <- map_ref$y
+  Xt <- map_target$x; Yt <- map_target$y
+  
+  # cost scale: 좌표 스케일을 1 근처로 맞춰서 exp(-C/eps) 언더플로우 방지
+  if (is.null(cost_scale)) {
+    rx <- max(c(Xr, Xt)) - min(c(Xr, Xt))
+    ry <- max(c(Yr, Yt)) - min(c(Yr, Yt))
+    cost_scale <- max(rx, ry)
+    if (!is.finite(cost_scale) || cost_scale <= tiny) cost_scale <- 1
+  }
+  
+  dx <- outer(Xr, Xt, "-") / cost_scale
+  dy <- outer(Yr, Yt, "-") / cost_scale
+  C  <- dx*dx + dy*dy
+  
+  sinkhorn_cost_rect(p, q, C, epsilon = epsilon, max_iter = max_iter, tiny = tiny)
+}
+
 
 # -------------------------------------------------------------------------
 # 5) Build result row (results.csv rev1 Final)
@@ -217,18 +254,18 @@ make_result_row <- function(msr_name,
                             direction,
                             sigma_score,
                             cliffs_delta,
-                            ws_spatial,
+                            spatial_drift,
                             mean_ref, sd_ref, mean_target, sd_target) {
   
   data.table::data.table(
-    msr         = as.character(msr_name),
-    direction   = as.character(direction),
-    sigma_score = as.numeric(sigma_score),
-    cliffs_delta= as.numeric(cliffs_delta),
-    ws_spatial  = as.numeric(ws_spatial),
-    mean_ref    = as.numeric(mean_ref),
-    sd_ref      = as.numeric(sd_ref),
-    mean_target = as.numeric(mean_target),
-    sd_target   = as.numeric(sd_target)
+    msr           = as.character(msr_name),
+    direction     = as.character(direction),
+    sigma_score   = as.numeric(sigma_score),
+    cliffs_delta  = as.numeric(cliffs_delta),
+    spatial_drift = as.numeric(spatial_drift),
+    mean_ref      = as.numeric(mean_ref),
+    sd_ref        = as.numeric(sd_ref),
+    mean_target   = as.numeric(mean_target),
+    sd_target     = as.numeric(sd_target)
   )
 }

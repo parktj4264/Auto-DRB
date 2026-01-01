@@ -14,6 +14,12 @@ if (length(miss_cols) > 0) {
   stop(sprintf("dt에 필수 컬럼이 없습니다: %s", paste(miss_cols, collapse=", ")))
 }
 
+# OT spatial_drift는 X/Y가 필요 (없으면 spatial_drift만 NA로 처리)
+has_xy <- all(c("X","Y") %in% names(dt))
+if (!has_xy) {
+  cat("WARNING: dt에 X/Y 컬럼이 없습니다. spatial_drift는 NA로 저장됩니다.\n")
+}
+
 # REF/TARGET 라벨 체크 (유연: 없으면 경고 후 가능한 만큼)
 u_groups_dt <- sort(unique(as.character(dt[[GROUP_COL]])))
 if (!(GROUP_REF_LABEL %in% u_groups_dt) || !(GROUP_TARGET_LABEL %in% u_groups_dt)) {
@@ -35,16 +41,18 @@ res_list <- vector("list", n_msr)
 
 # 미리 뽑아두는 벡터 (속도)
 g_all <- as.character(dt[[GROUP_COL]])
-r_all <- dt[[RADIUS_COL]]
+r_all <- dt[[RADIUS_COL]]  # 여기선 아직 사용 안 하더라도 (다른 지표 확장 대비) 유지
 
 # 그룹 인덱스는 루프 밖에서 한 번만 (속도 + 일관성)
 idx_ref    <- which(g_all == GROUP_REF_LABEL)
 idx_target <- which(g_all == GROUP_TARGET_LABEL)
 
-# ws_spatial 파라미터 (run.R에서 정의)
-if (!exists("WS_N_BINS")) WS_N_BINS <- 30
-if (!exists("WS_BIN_METHOD")) WS_BIN_METHOD <- "equal_width"
-if (!exists("WS_MIN_N_PER_BIN")) WS_MIN_N_PER_BIN <- 10
+# OT spatial_drift 파라미터 (run.R에서 정의)
+if (!exists("OT_Q")) OT_Q <- 0.8
+if (!exists("OT_EPSILON")) OT_EPSILON <- 0.1
+if (!exists("OT_MAX_ITER")) OT_MAX_ITER <- 80
+if (!exists("OT_COST_SCALE")) OT_COST_SCALE <- NULL
+if (!exists("OT_TINY")) OT_TINY <- 1e-12
 
 # 2) MSR loop ----------------------------------------------------------------
 for (i in seq_len(n_msr)) {
@@ -87,17 +95,39 @@ for (i in seq_len(n_msr)) {
     x_target = x_target
   )
   
-  # ws_spatial (radius profile L1 deviation)
-  # - radius는 같은 row index로 그룹별 분리해야 하므로 idx_ref/idx_target 사용
-  ws_spatial <- calc_ws_spatial(
-    radius_ref    = r_all[idx_ref],
-    x_ref         = x_all[idx_ref],
-    radius_target = r_all[idx_target],
-    x_target      = x_all[idx_target],
-    K             = WS_N_BINS,
-    method        = WS_BIN_METHOD,
-    min_n_per_bin = WS_MIN_N_PER_BIN
-  )
+  # spatial_drift (Sinkhorn OT on GROUP-averaged wafer maps)
+  spatial_drift <- NA_real_
+  if (has_xy && length(idx_ref) > 0 && length(idx_target) > 0) {
+    
+    # 그룹별 좌표-평균 맵 생성 (칩 좌표별 평균)
+    map_ref <- make_group_mean_map(
+      dt          = dt,
+      msr_col     = msr,
+      group_col   = GROUP_COL,
+      group_label = GROUP_REF_LABEL,
+      x_col       = "X",
+      y_col       = "Y"
+    )
+    
+    map_target <- make_group_mean_map(
+      dt          = dt,
+      msr_col     = msr,
+      group_col   = GROUP_COL,
+      group_label = GROUP_TARGET_LABEL,
+      x_col       = "X",
+      y_col       = "Y"
+    )
+    
+    spatial_drift <- calc_spatial_drift_sinkhorn(
+      map_ref     = map_ref,
+      map_target  = map_target,
+      q_clip      = OT_Q,
+      epsilon     = OT_EPSILON,
+      max_iter    = OT_MAX_ITER,
+      cost_scale  = OT_COST_SCALE,
+      tiny        = OT_TINY
+    )
+  }
   
   # 결과 row 생성 (Final schema)
   res_list[[i]] <- make_result_row(
@@ -105,7 +135,7 @@ for (i in seq_len(n_msr)) {
     direction     = direction,
     sigma_score   = sigma_score,
     cliffs_delta  = cliffs_delta,
-    ws_spatial    = ws_spatial,
+    spatial_drift = spatial_drift,
     mean_ref      = summ$mean_ref,
     sd_ref        = summ$sd_ref,
     mean_target   = summ$mean_target,

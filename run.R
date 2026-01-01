@@ -15,21 +15,21 @@ library(here)
 #   └ ROOTID.csv   ← ROOTID - GROUP 매핑 (웨이퍼 레벨)
 #
 # /output
-#   └ results.csv  ← DRB rev1.0 결과
+#   └ results.csv  ← DRB rev1 결과
 
 
 # parameter -----------------------------------------------------------
 # Only edit here!
 
 # --- input files ---
-FILE_NAME_RAW      <- "raw.csv"
-FILE_NAME_META     <- "ROOTID.csv"
+FILE_NAME_RAW       <- "raw.csv"
+FILE_NAME_META      <- "ROOTID.csv"
 
 # --- key column names ---
-ROOTID_COL         <- "ROOTID"
-GROUP_COL          <- "GROUP"
-PARTID_COL         <- "PARTID"
-RADIUS_COL         <- "Radius"     # 실무: 좌/우 signed position (-150~150)
+ROOTID_COL          <- "ROOTID"
+GROUP_COL           <- "GROUP"
+PARTID_COL          <- "PARTID"
+RADIUS_COL          <- "Radius"     # 실무: 좌/우 signed position (-150~150)
 
 # --- group definition ---
 # 원칙: REF=기준(Old), TARGET=변경(New)
@@ -41,23 +41,30 @@ GROUP_TARGET_LABEL  <- "B"
 # 1) direction 판정용 threshold (k-sigma)
 # - sigma_score = (mean_target - mean_ref) / sd_ref
 # - direction: Up/Down/Stable을 나누는 기준
-SIGMA_LEVEL         <- 0.3          # 예: 0.5 / 1.0 / 1.5
+SIGMA_LEVEL         <- 0.3          # 예: 0.3 / 0.5 / 1.0 / 1.5
 
-# 2) spatial score (ws_spatial) 계산용 binning
-WS_N_BINS           <- 30           # Radius를 몇 구간으로 나눌지 (K)
-WS_BIN_METHOD       <- "equal_width" # "equal_width" or "quantile"
+# 2) spatial_drift (Sinkhorn OT) parameters
+# Phase 1: clipping quantile (top 20%만 남기는 설정이면 0.8)
+OT_Q                <- 0.80         # quantile threshold τ = Q(value, OT_Q)
 
-# (optional) 빈(bin)에 표본이 너무 적으면 해당 bin 제외
-WS_MIN_N_PER_BIN    <- 10
+# Phase 3: Sinkhorn regularization + iterations
+OT_EPSILON          <- 0.10         # ε (regularization)
+OT_MAX_ITER         <- 80           # 100 미만 권장 (속도)
+
+# cost scaling (optional)
+# - 좌표가 (0~300) 스케일이면 자동으로도 되는데,
+#   데이터마다 스케일 다르면 여기서 조절 가능
+OT_COST_SCALE       <- NULL         # NULL이면 내부에서 자동/기본 사용
+
+# numeric stability
+OT_TINY             <- 1e-12        # 0나눗셈 방지용
 
 # --- output ---
 OUT_DIR             <- "output"
 OUT_FILE_RESULTS    <- "results.csv"
 
-
 # start ---------------------------------------------------------------
 source(here::here("main.R"), encoding = "UTF-8")
-
 
 
 

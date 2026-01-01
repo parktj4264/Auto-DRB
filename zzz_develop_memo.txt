@@ -24,7 +24,7 @@
         00_utils.R
         01_load.R
         02_funcs.R
-        03_calc.R
+        03_calc.R 
         04_save.R
 		
 		
@@ -50,69 +50,3 @@ _______
 일케 가능?
 
 _______
-
-ㅇㅋ 땅땅땅 ✅ 그 스펙으로 results.csv v1.0 확정.
-그리고 MSR 식별도 “실데이터 기준”으로 PARTID 이후 전부가 정답인 걸로 고정하면 깔끔하다.
-
-정리해서 박아두면 이렇게야:
-
-✅ MSR 컬럼 정의 (실데이터 기준)
-
-raw.csv에서 PARTID 컬럼 바로 다음 열부터 끝까지
-→ 전부 MSR로 간주
-
-(보안 때문에 시뮬에서는 MSR000…로 이름만 바꾼 거고, 실제 운영은 이 규칙)
-
-✅ results.csv 컬럼 스펙 (v1.0 “땅땅땅”)
-
-순서도 너가 적은 그대로:
-
-MSR
-
-Shock_up
-
-Shock_down
-
-Wilcox_flag
-
-KS_flag
-
-mean_A
-
-sd_A
-
-mean_B
-
-sd_B
-
-mean_diff
-
-median_diff
-
-각 컬럼 의미(짧게, 회의용 언어)
-
-Shock_up: Ā + sA < B̄ − sB
-
-Shock_down: Ā − sA > B̄ + sB
-
-Wilcox_flag: 칩 풀링 Wilcoxon에서 강한 신호(임계값은 코드에서 고정)
-
-KS_flag: 칩 풀링 KS(너 실무 Radius 축 기준)에서 강한 신호
-
-mean_A/sd_A/mean_B/sd_B: 그룹별 칩 풀링 요약
-
-mean_diff: mean_B − mean_A
-
-median_diff: median_B − median_A
-
-이제 남은 건 딱 2개 “정책”만 코드에서 박으면 완성임:
-
-Wilcox_flag 임계값(예: p < 1e-3 같은 강한 기준)
-
-KS_flag 임계값(동일하게 강한 기준)
-
-다음 턴에서 너가 “ㅇㅋ 임계값 이렇게”만 던져주면, 그 스펙대로 01_load.R / 03_calc.R 깔끔하게 이어서 설계 들어가면 된다
-
-_______
-
-자 이제 run.R 부터 parameter 골라주라고하자
