@@ -15,3 +15,9 @@ renv/library/
 renv/local/
 renv/python/
 renv/staging/
+
+
+# -----
+# project 추가
+raw.csv
+/data_before/

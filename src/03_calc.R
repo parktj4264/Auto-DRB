@@ -8,14 +8,15 @@ if (!exists("dt")) stop("dt가 없습니다. 01_load.R 실행 여부를 확인�
 if (!exists("MSR_COLS") || length(MSR_COLS) == 0) stop("MSR_COLS가 없습니다. 01_load.R의 MSR 식별을 확인하세요.")
 
 # 필수 컬럼 존재 체크 (경고 수준으로 최대한 유연하게)
-need_cols <- c(ROOTID_COL, GROUP_COL, RADIUS_COL, PARTID_COL)
+# NOTE: rev1 최종은 Radius 강제 아님 (spatial_drift는 X/Y 필요)
+need_cols <- c(ROOTID_COL, GROUP_COL, PARTID_COL)
 miss_cols <- setdiff(need_cols, names(dt))
 if (length(miss_cols) > 0) {
   stop(sprintf("dt에 필수 컬럼이 없습니다: %s", paste(miss_cols, collapse=", ")))
 }
 
 # OT spatial_drift는 X/Y가 필요 (없으면 spatial_drift만 NA로 처리)
-has_xy <- all(c("X","Y") %in% names(dt))
+has_xy <- all(c(X_COL, Y_COL) %in% names(dt))
 if (!has_xy) {
   cat("WARNING: dt에 X/Y 컬럼이 없습니다. spatial_drift는 NA로 저장됩니다.\n")
 }
@@ -41,18 +42,19 @@ res_list <- vector("list", n_msr)
 
 # 미리 뽑아두는 벡터 (속도)
 g_all <- as.character(dt[[GROUP_COL]])
-r_all <- dt[[RADIUS_COL]]  # 여기선 아직 사용 안 하더라도 (다른 지표 확장 대비) 유지
 
 # 그룹 인덱스는 루프 밖에서 한 번만 (속도 + 일관성)
 idx_ref    <- which(g_all == GROUP_REF_LABEL)
 idx_target <- which(g_all == GROUP_TARGET_LABEL)
 
 # OT spatial_drift 파라미터 (run.R에서 정의)
-if (!exists("OT_Q")) OT_Q <- 0.8
-if (!exists("OT_EPSILON")) OT_EPSILON <- 0.1
-if (!exists("OT_MAX_ITER")) OT_MAX_ITER <- 80
-if (!exists("OT_COST_SCALE")) OT_COST_SCALE <- NULL
-if (!exists("OT_TINY")) OT_TINY <- 1e-12
+if (!exists("OT_SIGMA_THRESH"))  OT_SIGMA_THRESH  <- 3.0
+if (!exists("OT_SMOOTH_SIGMA"))  OT_SMOOTH_SIGMA  <- 1.0
+if (!exists("OT_EPSILON"))       OT_EPSILON       <- 0.1
+if (!exists("OT_MAX_ITER"))      OT_MAX_ITER      <- 80
+if (!exists("OT_COST_SCALE"))    OT_COST_SCALE    <- NULL
+if (!exists("OT_EMPTY_PENALTY")) OT_EMPTY_PENALTY <- 1.0
+if (!exists("OT_TINY"))          OT_TINY          <- 1e-12
 
 # 2) MSR loop ----------------------------------------------------------------
 for (i in seq_len(n_msr)) {
@@ -100,13 +102,14 @@ for (i in seq_len(n_msr)) {
   if (has_xy && length(idx_ref) > 0 && length(idx_target) > 0) {
     
     # 그룹별 좌표-평균 맵 생성 (칩 좌표별 평균)
+    # - 반드시 (x,y)별 평균 v를 만들어서 "그룹 평균 웨이퍼맵"을 만든다
     map_ref <- make_group_mean_map(
       dt          = dt,
       msr_col     = msr,
       group_col   = GROUP_COL,
       group_label = GROUP_REF_LABEL,
-      x_col       = "X",
-      y_col       = "Y"
+      x_col       = X_COL,
+      y_col       = Y_COL
     )
     
     map_target <- make_group_mean_map(
@@ -114,18 +117,21 @@ for (i in seq_len(n_msr)) {
       msr_col     = msr,
       group_col   = GROUP_COL,
       group_label = GROUP_TARGET_LABEL,
-      x_col       = "X",
-      y_col       = "Y"
+      x_col       = X_COL,
+      y_col       = Y_COL
     )
     
+    # Z-filter + smoothing + Sinkhorn OT
     spatial_drift <- calc_spatial_drift_sinkhorn(
-      map_ref     = map_ref,
-      map_target  = map_target,
-      q_clip      = OT_Q,
-      epsilon     = OT_EPSILON,
-      max_iter    = OT_MAX_ITER,
-      cost_scale  = OT_COST_SCALE,
-      tiny        = OT_TINY
+      map_ref       = map_ref,
+      map_target    = map_target,
+      sigma_thresh  = OT_SIGMA_THRESH,
+      smooth_sigma  = OT_SMOOTH_SIGMA,
+      epsilon       = OT_EPSILON,
+      max_iter      = OT_MAX_ITER,
+      cost_scale    = OT_COST_SCALE,
+      empty_penalty = OT_EMPTY_PENALTY,
+      tiny          = OT_TINY
     )
   }
   

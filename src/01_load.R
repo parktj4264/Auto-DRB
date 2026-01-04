@@ -1,5 +1,6 @@
 # src/01_load.R ------------------------------------------------------------
 
+
 # 1. 파일 경로 설정 및 체크 -------------------------------------------------
 cat("Reading data...\n")
 
@@ -19,8 +20,8 @@ cat(sprintf("Meta Loaded: %s rows, %s cols\n", format(nrow(dt_meta), big.mark=",
 
 
 # 3. 필수 컬럼 유효성 체크 ----------------------------------------------------
-# raw 필수: ROOTID, PARTID, Radius(실무 signed 축)
-req_raw  <- c(ROOTID_COL, PARTID_COL, RADIUS_COL)
+# raw 필수: ROOTID, PARTID
+req_raw  <- c(ROOTID_COL, PARTID_COL)
 miss_raw <- setdiff(req_raw, names(dt_raw))
 if (length(miss_raw) > 0) {
   stop(sprintf("raw.csv에 필수 컬럼 없음: %s", paste(miss_raw, collapse = ", ")))
@@ -35,7 +36,7 @@ if (length(miss_meta) > 0) {
 
 
 # 4. MSR 컬럼 식별 (PARTID 이후 전부) ---------------------------------------
-cat(">> Identifying MSR columns based on 'PARTID' (raw 기준)...\n")
+cat(">> Identifying MSR columns based on 'PARTID'...\n")
 
 idx_partid <- which(names(dt_raw) == PARTID_COL)
 if (length(idx_partid) != 1) stop("raw.csv에서 PARTID 컬럼이 없거나(또는 중복)합니다.")

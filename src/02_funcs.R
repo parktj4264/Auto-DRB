@@ -49,6 +49,27 @@ split_ref_target <- function(x, g, ref_label, target_label) {
   )
 }
 
+# MAP Average Function
+make_group_mean_map <- function(dt, msr_col, group_col, group_label,
+                                x_col = "X", y_col = "Y") {
+  
+  # dt: 01_load.R 결과 (GROUP 붙어있어야 함)
+  # return: data.table(x, y, v)
+  
+  d0 <- dt[get(group_col) == group_label, .(
+    x = safe_as_numeric(get(x_col)),
+    y = safe_as_numeric(get(y_col)),
+    v = safe_as_numeric(get(msr_col))
+  )]
+  
+  d0 <- d0[is.finite(x) & is.finite(y) & is.finite(v)]
+  if (nrow(d0) == 0) return(data.table::data.table(x=numeric(0), y=numeric(0), v=numeric(0)))
+  
+  # "그룹 내 웨이퍼들"을 평균내서 대표 맵 생성
+  d0[, .(v = mean(v, na.rm = TRUE)), by = .(x, y)]
+}
+
+
 # -------------------------------------------------------------------------
 # 1) Summary stats (chip pooling)
 # -------------------------------------------------------------------------
@@ -129,121 +150,258 @@ calc_cliffs_delta <- function(x_ref, x_target) {
   as.numeric(delta)
 }
 
-
 # -------------------------------------------------------------------------
-# 4) spatial_drift (Sinkhorn OT on GROUP-averaged wafer maps)
-#    - 목적: REF vs TARGET의 "형상(Shape)" 차이를 물리적 이동 비용으로 정량화
+# 4) spatial_drift (Robust preprocess -> Smooth -> Sinkhorn OT)
+#    - map_ref / map_target: data.table(x, y, v)
+#    - Output: scalar distance (shape drift)
 #
-#    Phase 1) clipping (상위 20%만 남김, 나머지는 0)
-#       f_clip(v) = max(v - tau, 0),  tau = quantile(v, q_clip)
-#
-#    Phase 2) density normalization (총합=1)
-#       sum(w)==0 이면 uniform 분포 할당
-#
-#    Phase 3) Sinkhorn distance (entropic OT)
-#       cost C_ij = ||s_i - t_j||^2  (scaled to avoid numeric underflow)
-#
-#    params (run.R 권장):
-#      q_clip     : OT_Q           (default 0.8)
-#      epsilon    : OT_EPSILON     (default 0.1)  # cost scale 적용 전제
-#      max_iter   : OT_MAX_ITER    (<100)
-#      cost_scale : OT_COST_SCALE  (NULL이면 자동)
-#      tiny       : OT_TINY
+# 핵심 아이디어:
+#  (1) Z-filter: abs(z) > sigma_thresh 만 에너지로 인정
+#  (2) Smooth: gaussian kernel convolution으로 blob화
+#  (3) OT: nonzero support만 추려 Sinkhorn distance 계산
 # -------------------------------------------------------------------------
 
-clip_relu <- function(v, q = 0.8) {
-  if (length(v) == 0) return(numeric(0))
-  tau <- stats::quantile(v, probs = q, na.rm = TRUE, names = FALSE, type = 7)
-  pmax(v - tau, 0)
+# --- Helper: safe numeric ---
+safe_as_numeric <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
 }
 
-normalize_prob <- function(w, tiny = 1e-12) {
-  n <- length(w)
-  if (n == 0) return(numeric(0))
-  s <- sum(w)
-  if (!is.finite(s) || s <= tiny) {
-    return(rep(1 / n, n))
+# ---------------------------------------
+# [Helper 1] Gaussian Kernel (2D)
+# ---------------------------------------
+make_gaussian_kernel <- function(sigma = 1.0) {
+  if (!is.finite(sigma) || sigma <= 0) return(matrix(1, 1, 1))
+  
+  k_size <- ceiling(3 * sigma) * 2 + 1  # 3-sigma rule
+  center <- (k_size + 1) / 2
+  
+  ii <- seq_len(k_size)
+  jj <- seq_len(k_size)
+  d2 <- (ii - center)^2
+  # outer로 벡터화
+  kernel <- exp(-(outer(d2, d2, "+")) / (2 * sigma^2))
+  kernel / sum(kernel)
+}
+
+# ---------------------------------------
+# [Helper 2] 2D Convolution (naive but ok for <= ~301x301)
+# ---------------------------------------
+conv2_same <- function(mat, kernel) {
+  nr <- nrow(mat); nc <- ncol(mat)
+  kr <- nrow(kernel); kc <- ncol(kernel)
+  khr <- floor(kr / 2); khc <- floor(kc / 2)
+  
+  # padding
+  padded <- matrix(0, nr + 2 * khr, nc + 2 * khc)
+  padded[(khr + 1):(nr + khr), (khc + 1):(nc + khc)] <- mat
+  
+  out <- matrix(0, nr, nc)
+  
+  # (루프지만 nr*nc가 90k 정도면 실무에서도 대체로 버팀)
+  for (i in seq_len(nr)) {
+    for (j in seq_len(nc)) {
+      sub_m <- padded[i:(i + 2 * khr), j:(j + 2 * khc)]
+      out[i, j] <- sum(sub_m * kernel)
+    }
   }
+  out
+}
+
+# ---------------------------------------
+# [Helper 3] Robust Preprocess: Z-filter -> Smooth
+#   - return: data.table(x, y, w)  (w >= 0)
+# ---------------------------------------
+preprocess_map_robust <- function(map_dt,
+                                  sigma_thresh = 3.0,
+                                  smooth_sigma = 1.0,
+                                  tiny = 1e-12) {
+  # map_dt must have x,y,v
+  if (is.null(map_dt) || nrow(map_dt) == 0) {
+    return(data.table::data.table(x = numeric(0), y = numeric(0), w = numeric(0)))
+  }
+  
+  dt0 <- data.table::as.data.table(map_dt)[, .(x, y, v)]
+  dt0[, x := safe_as_numeric(x)]
+  dt0[, y := safe_as_numeric(y)]
+  dt0[, v := safe_as_numeric(v)]
+  
+  # 좌표 NA 제거
+  dt0 <- dt0[is.finite(x) & is.finite(y)]
+  if (nrow(dt0) == 0) {
+    return(data.table::data.table(x = numeric(0), y = numeric(0), w = numeric(0)))
+  }
+  
+  # 혹시 중복좌표 있으면 평균으로 정리 (그룹 평균 맵 만든 뒤라도 안전빵)
+  dt0 <- dt0[, .(v = mean(v, na.rm = TRUE)), by = .(x, y)]
+  
+  vals <- dt0$v
+  mu <- mean(vals, na.rm = TRUE)
+  sdv <- stats::sd(vals, na.rm = TRUE)
+  
+  # 예외: sd=0 or NA -> 전부 0 (shape 신호 없음)
+  if (!is.finite(sdv) || sdv < tiny) {
+    dt0[, w := 0.0]
+    return(dt0[, .(x, y, w)])
+  }
+  
+  # Z-score (NA 안전)
+  z <- (vals - mu) / sdv
+  z[!is.finite(z)] <- 0
+  
+  # 에너지: abs(z) > thresh만 남김 (나머지 0)
+  if (!is.finite(sigma_thresh) || sigma_thresh <= 0) sigma_thresh <- 0
+  w0 <- ifelse(abs(z) > sigma_thresh, abs(z), 0)
+  
+  # smoothing
+  if (is.finite(smooth_sigma) && smooth_sigma > 0) {
+    # 좌표 범위 -> matrix
+    x_rng <- range(dt0$x, na.rm = TRUE)
+    y_rng <- range(dt0$y, na.rm = TRUE)
+    
+    # 정수 격자 가정 (실무에서 x,y가 정수인 경우)
+    # 혹시 실수면: 여기서 라운딩/빈닝이 필요할 수 있음 (현재는 그대로 씀)
+    xs <- sort(unique(dt0$x))
+    ys <- sort(unique(dt0$y))
+    
+    # 만약 x,y가 “연속 실수”로 들어오면 grid가 너무 커질 수 있음
+    # -> 그 경우는 03_calc에서 좌표를 binning(예: round/scale)해서 맵 만들기를 추천
+    if (length(xs) * length(ys) > 400000) {
+      # 너무 큰 grid 방어: smoothing skip
+      dt0[, w := w0]
+      return(dt0[, .(x, y, w)])
+    }
+    
+    # index map
+    x_to_c <- match(dt0$x, xs)
+    y_to_r <- match(dt0$y, ys)
+    
+    mat <- matrix(0, nrow = length(ys), ncol = length(xs))
+    mat[cbind(y_to_r, x_to_c)] <- w0
+    
+    kernel <- make_gaussian_kernel(smooth_sigma)
+    res_mat <- conv2_same(mat, kernel)
+    
+    w_sm <- res_mat[cbind(y_to_r, x_to_c)]
+    w_sm[!is.finite(w_sm)] <- 0
+    dt0[, w := as.numeric(w_sm)]
+  } else {
+    dt0[, w := as.numeric(w0)]
+  }
+  
+  # 음수 방지(원래 없어야 함)
+  dt0[w < 0, w := 0.0]
+  dt0[, .(x, y, w)]
+}
+
+# ---------------------------------------
+# [Helper 4] Normalize to probability
+# ---------------------------------------
+normalize_prob <- function(w, tiny = 1e-12) {
+  s <- sum(w, na.rm = TRUE)
+  if (!is.finite(s) || s < tiny) return(rep(1 / length(w), length(w)))
   w / s
 }
 
-sinkhorn_cost_rect <- function(p, q, C, epsilon = 0.1, max_iter = 80, tiny = 1e-12) {
-  # p: length n, q: length m, C: n x m
+# ---------------------------------------
+# [Helper 5] Sinkhorn cost for rectangular supports
+#   p: length n, q: length m, C: n x m
+#   return: scalar cost = sum_{i,j} gamma_ij * C_ij
+# ---------------------------------------
+sinkhorn_cost_rect <- function(p, q, C,
+                               epsilon = 0.1,
+                               max_iter = 80,
+                               tiny = 1e-12) {
+  n <- length(p); m <- length(q)
+  if (n == 0 || m == 0) return(NA_real_)
+  if (!is.finite(epsilon) || epsilon <= 0) epsilon <- 0.1
+  
+  # kernel
   K <- exp(-C / epsilon)
-  K[K < tiny] <- tiny
+  K[!is.finite(K)] <- 0
+  K[K < tiny] <- 0
   
-  u <- rep(1, length(p))
-  v <- rep(1, length(q))
+  u <- rep(1, n)
+  v <- rep(1, m)
   
-  for (t in seq_len(max_iter)) {
-    Kv <- K %*% v
-    Kv[ Kv < tiny ] <- tiny
-    u <- p / as.numeric(Kv)
+  # iterations
+  for (it in seq_len(max_iter)) {
+    Kv <- as.numeric(K %*% v)
+    Kv[Kv < tiny] <- tiny
+    u <- p / Kv
     
-    KTu <- t(K) %*% u
-    KTu[ KTu < tiny ] <- tiny
-    v <- q / as.numeric(KTu)
+    Ktu <- as.numeric(t(K) %*% u)
+    Ktu[Ktu < tiny] <- tiny
+    v <- q / Ktu
   }
   
-  # transport plan P_ij = u_i * K_ij * v_j
-  # cost = sum(P * C)
-  P <- (u * (K * rep(v, each = length(u))))
-  sum(P * C)
+  # cost = sum_{i,j} u_i K_ij v_j C_ij
+  #      = sum_i u_i * sum_j (K_ij * C_ij * v_j)
+  KCv <- as.numeric((K * C) %*% v)
+  cost <- sum(u * KCv)
+  as.numeric(cost)
 }
 
-# group-averaged map (칩 좌표별 평균)
-make_group_mean_map <- function(dt, msr_col, group_col, group_label, x_col, y_col) {
-  dt_sub <- dt[get(group_col) == group_label, .(
-    x = suppressWarnings(as.numeric(get(x_col))),
-    y = suppressWarnings(as.numeric(get(y_col))),
-    v = suppressWarnings(as.numeric(get(msr_col)))
-  )]
-  
-  dt_sub <- dt_sub[is.finite(x) & is.finite(y) & is.finite(v)]
-  if (nrow(dt_sub) == 0) {
-    return(data.table::data.table(x = numeric(0), y = numeric(0), v = numeric(0)))
-  }
-  
-  # 좌표별 평균 (칩 pooling -> wafer 평균맵 1장)
-  dt_sub[, .(v = mean(v)), by = .(x, y)]
-}
 
+# ---------------------------------------
+# [Main] spatial drift (robust preprocess + sinkhorn)
+#  - map_ref / map_target: data.table(x,y,v)
+#  - returns scalar distance
+# ---------------------------------------
 calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
-                                        q_clip = 0.8,
+                                        sigma_thresh = 3.0,
+                                        smooth_sigma = 1.0,
                                         epsilon = 0.1,
                                         max_iter = 80,
                                         cost_scale = NULL,
+                                        empty_penalty = 1.0,
                                         tiny = 1e-12) {
-  # map_ref / map_target: data.table(x,y,v)
-  
+  if (is.null(map_ref) || is.null(map_target)) return(NA_real_)
   if (nrow(map_ref) == 0 || nrow(map_target) == 0) return(NA_real_)
   
-  # Phase 1: clipping (각 그룹 내부에서 threshold)
-  w_ref <- clip_relu(map_ref$v, q = q_clip)
-  w_tar <- clip_relu(map_target$v, q = q_clip)
+  # Phase 1: robust preprocess
+  dt_r <- preprocess_map_robust(map_ref, sigma_thresh = sigma_thresh, smooth_sigma = smooth_sigma, tiny = tiny)
+  dt_t <- preprocess_map_robust(map_target, sigma_thresh = sigma_thresh, smooth_sigma = smooth_sigma, tiny = tiny)
   
-  # Phase 2: normalize
-  p <- normalize_prob(w_ref, tiny = tiny)
-  q <- normalize_prob(w_tar, tiny = tiny)
+  sr <- sum(dt_r$w, na.rm = TRUE)
+  st <- sum(dt_t$w, na.rm = TRUE)
   
-  # support coords
-  Xr <- map_ref$x; Yr <- map_ref$y
-  Xt <- map_target$x; Yt <- map_target$y
+  # 둘 다 신호 없으면 0
+  if (sr < tiny && st < tiny) return(0.0)
   
-  # cost scale: 좌표 스케일을 1 근처로 맞춰서 exp(-C/eps) 언더플로우 방지
+  # 한쪽만 신호 있으면 penalty
+  if (sr < tiny || st < tiny) return(as.numeric(empty_penalty))
+  
+  # OT support를 nonzero만 (속도 핵심)
+  dt_r2 <- dt_r[w > 0]
+  dt_t2 <- dt_t[w > 0]
+  
+  if (nrow(dt_r2) == 0 && nrow(dt_t2) == 0) return(0.0)
+  if (nrow(dt_r2) == 0 || nrow(dt_t2) == 0) return(as.numeric(empty_penalty))
+  
+  p <- normalize_prob(dt_r2$w, tiny = tiny)
+  q <- normalize_prob(dt_t2$w, tiny = tiny)
+  
+  Xr <- dt_r2$x; Yr <- dt_r2$y
+  Xt <- dt_t2$x; Yt <- dt_t2$y
+  
+  # cost scaling (좌표 scale 안정화)
   if (is.null(cost_scale)) {
-    rx <- max(c(Xr, Xt)) - min(c(Xr, Xt))
-    ry <- max(c(Yr, Yt)) - min(c(Yr, Yt))
+    rx <- max(c(Xr, Xt), na.rm = TRUE) - min(c(Xr, Xt), na.rm = TRUE)
+    ry <- max(c(Yr, Yt), na.rm = TRUE) - min(c(Yr, Yt), na.rm = TRUE)
     cost_scale <- max(rx, ry)
-    if (!is.finite(cost_scale) || cost_scale <= tiny) cost_scale <- 1
+    if (!is.finite(cost_scale) || cost_scale < tiny) cost_scale <- 1
+  } else {
+    if (!is.finite(cost_scale) || cost_scale < tiny) cost_scale <- 1
   }
   
   dx <- outer(Xr, Xt, "-") / cost_scale
   dy <- outer(Yr, Yt, "-") / cost_scale
-  C  <- dx*dx + dy*dy
+  C  <- dx * dx + dy * dy
   
   sinkhorn_cost_rect(p, q, C, epsilon = epsilon, max_iter = max_iter, tiny = tiny)
 }
+
 
 
 # -------------------------------------------------------------------------

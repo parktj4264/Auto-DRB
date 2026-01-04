@@ -25,16 +25,17 @@ library(here)
 FILE_NAME_RAW       <- "raw.csv"
 FILE_NAME_META      <- "ROOTID.csv"
 
-# --- key column names ---
-ROOTID_COL          <- "ROOTID"
-GROUP_COL           <- "GROUP"
-PARTID_COL          <- "PARTID"
-RADIUS_COL          <- "Radius"     # 실무: 좌/우 signed position (-150~150)
-
 # --- group definition ---
 # 원칙: REF=기준(Old), TARGET=변경(New)
 GROUP_REF_LABEL     <- "A"
 GROUP_TARGET_LABEL  <- "B"
+
+
+ROOTID_COL <- "ROOTID"
+PARTID_COL <- "PARTID"
+GROUP_COL  <- "GROUP"
+X_COL <- "X"
+Y_COL <- "Y"
 
 # --- DRB rev1 parameters --------------------------------------------
 
@@ -43,21 +44,21 @@ GROUP_TARGET_LABEL  <- "B"
 # - direction: Up/Down/Stable을 나누는 기준
 SIGMA_LEVEL         <- 0.3          # 예: 0.3 / 0.5 / 1.0 / 1.5
 
-# 2) spatial_drift (Sinkhorn OT) parameters
-# Phase 1: clipping quantile (top 20%만 남기는 설정이면 0.8)
-OT_Q                <- 0.80         # quantile threshold τ = Q(value, OT_Q)
-
+# 2) spatial_drift (Robust preprocess -> Smooth -> Sinkhorn OT)
+# Phase 1: Z-filter (abs(z) > thresh 만 에너지로 인정)
+OT_SIGMA_THRESH     <- 3.0
+# Phase 2: smoothing sigma (blob화)
+OT_SMOOTH_SIGMA     <- 1.0
 # Phase 3: Sinkhorn regularization + iterations
-OT_EPSILON          <- 0.10         # ε (regularization)
-OT_MAX_ITER         <- 80           # 100 미만 권장 (속도)
-
+OT_EPSILON          <- 0.10
+OT_MAX_ITER         <- 80
 # cost scaling (optional)
-# - 좌표가 (0~300) 스케일이면 자동으로도 되는데,
-#   데이터마다 스케일 다르면 여기서 조절 가능
-OT_COST_SCALE       <- NULL         # NULL이면 내부에서 자동/기본 사용
-
+OT_COST_SCALE       <- NULL  # NULL이면 내부에서 자동
+# empty case handling
+OT_EMPTY_PENALTY    <- 1.0   # 한쪽만 신호 있으면 penalty
 # numeric stability
-OT_TINY             <- 1e-12        # 0나눗셈 방지용
+OT_TINY             <- 1e-12
+
 
 # --- output ---
 OUT_DIR             <- "output"
