@@ -55,6 +55,7 @@ if (!exists("OT_MAX_ITER"))      OT_MAX_ITER      <- 80
 if (!exists("OT_COST_SCALE"))    OT_COST_SCALE    <- NULL
 if (!exists("OT_EMPTY_PENALTY")) OT_EMPTY_PENALTY <- 1.0
 if (!exists("OT_TINY"))          OT_TINY          <- 1e-12
+if (!exists("OT_MASK_GAIN"))     OT_MASK_GAIN     <- 2.0
 
 # 2) MSR loop ----------------------------------------------------------------
 for (i in seq_len(n_msr)) {
@@ -127,6 +128,7 @@ for (i in seq_len(n_msr)) {
       map_target    = map_target,
       sigma_thresh  = OT_SIGMA_THRESH,
       smooth_sigma  = OT_SMOOTH_SIGMA,
+      mask_gain     = OT_MASK_GAIN,
       epsilon       = OT_EPSILON,
       max_iter      = OT_MAX_ITER,
       cost_scale    = OT_COST_SCALE,

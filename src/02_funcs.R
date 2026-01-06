@@ -9,7 +9,7 @@
 # DRB rev1 (Final):
 # - sigma_score      : Glass's delta = (mean_target - mean_ref) / sd_ref
 # - cliffs_delta     : distribution dominance (Wilcoxon W -> U -> delta)
-# - spatial_drift    : Wasserstein Distance (Geometry / Optimal Transport)
+# - spatial_drift    : Sinkhorn OT distance on preprocessed wafer maps
 # - direction        : Up/Down/Stable (threshold = SIGMA_LEVEL)
 
 # -------------------------------------------------------------------------
@@ -69,7 +69,6 @@ make_group_mean_map <- function(dt, msr_col, group_col, group_label,
   d0[, .(v = mean(v, na.rm = TRUE)), by = .(x, y)]
 }
 
-
 # -------------------------------------------------------------------------
 # 1) Summary stats (chip pooling)
 # -------------------------------------------------------------------------
@@ -105,7 +104,6 @@ calc_sigma_score <- function(mean_ref, sd_ref, mean_target) {
 }
 
 direction_from_sigma <- function(sigma_score, sigma_level) {
-  # sigma_level = SIGMA_LEVEL (예: 0.5 / 1.0 / 1.5)
   if (!is.finite(sigma_score) || !is.finite(sigma_level)) return("Stable")
   if (sigma_score >= sigma_level) return("Up")
   if (sigma_score <= -sigma_level) return("Down")
@@ -114,14 +112,7 @@ direction_from_sigma <- function(sigma_score, sigma_level) {
 
 # -------------------------------------------------------------------------
 # 3) cliffs_delta (Stochastic Dominance)
-#    - Mann–Whitney U 기반 Cliff's delta (Target > Ref 우세면 +)
-#    - delta = 2U/(n_t*n_r) - 1
-#
-#    주의:
-#    - R의 wilcox.test(x, y)$statistic 은 이름이 "W"로 나오지만,
-#      2-sample에서는 R 내부 정의상 U(= rank-sum에서 m(m+1)/2 뺀 값)에 해당하는 형태로 반환됨.
-#    - 따라서 여기서는 추가로 m(m+1)/2를 빼지 않는다.
-#    - Target 우세를 +로 만들려면 wilcox.test(x_target, x_ref)로 호출.
+#    - delta = 2U/(n_t*n_r) - 1  (Target > Ref 우세면 +)
 # -------------------------------------------------------------------------
 
 calc_cliffs_delta <- function(x_ref, x_target) {
@@ -136,7 +127,6 @@ calc_cliffs_delta <- function(x_ref, x_target) {
   
   if (n_r < 1 || n_t < 1) return(NA_real_)
   
-  # R의 "W" (2-sample): 사실상 U 형태(shifted rank-sum)로 리턴되는 값
   U <- tryCatch({
     as.numeric(stats::wilcox.test(xt, xr, alternative = "two.sided", exact = FALSE)$statistic)
   }, error = function(e) NA_real_)
@@ -151,21 +141,18 @@ calc_cliffs_delta <- function(x_ref, x_target) {
 }
 
 # -------------------------------------------------------------------------
-# 4) spatial_drift (Robust preprocess -> Smooth -> Sinkhorn OT)
+# 4) spatial_drift (Preprocess -> Sinkhorn OT)
 #    - map_ref / map_target: data.table(x, y, v)
 #    - Output: scalar distance (shape drift)
 #
-# 핵심 아이디어:
-#  (1) Z-filter: abs(z) > sigma_thresh 만 에너지로 인정
-#  (2) Smooth: gaussian kernel convolution으로 blob화
-#  (3) OT: nonzero support만 추려 Sinkhorn distance 계산
+# Preprocess (rev1.1):
+#  (1) Z-filter: abs(z) > sigma_thresh -> energy w0
+#  (2) Dual convolution:
+#      - sm = Smooth(w0)          : intensity diffusion
+#      - d  = Smooth(mask(w0>0))  : density estimation
+#  (3) final = sm * Sat(d * mask_gain)  (cluster 강조 / 고립 노이즈 억제)
+#  (4) OT는 final을 질량(w)로 사용
 # -------------------------------------------------------------------------
-
-# --- Helper: safe numeric ---
-safe_as_numeric <- function(x) {
-  if (is.numeric(x)) return(x)
-  suppressWarnings(as.numeric(x))
-}
 
 # ---------------------------------------
 # [Helper 1] Gaussian Kernel (2D)
@@ -173,32 +160,29 @@ safe_as_numeric <- function(x) {
 make_gaussian_kernel <- function(sigma = 1.0) {
   if (!is.finite(sigma) || sigma <= 0) return(matrix(1, 1, 1))
   
-  k_size <- ceiling(3 * sigma) * 2 + 1  # 3-sigma rule
+  k_size <- ceiling(3 * sigma) * 2 + 1
   center <- (k_size + 1) / 2
   
   ii <- seq_len(k_size)
-  jj <- seq_len(k_size)
   d2 <- (ii - center)^2
-  # outer로 벡터화
+  
   kernel <- exp(-(outer(d2, d2, "+")) / (2 * sigma^2))
   kernel / sum(kernel)
 }
 
 # ---------------------------------------
-# [Helper 2] 2D Convolution (naive but ok for <= ~301x301)
+# [Helper 2] 2D Convolution (same padding)
 # ---------------------------------------
 conv2_same <- function(mat, kernel) {
   nr <- nrow(mat); nc <- ncol(mat)
   kr <- nrow(kernel); kc <- ncol(kernel)
   khr <- floor(kr / 2); khc <- floor(kc / 2)
   
-  # padding
   padded <- matrix(0, nr + 2 * khr, nc + 2 * khc)
   padded[(khr + 1):(nr + khr), (khc + 1):(nc + khc)] <- mat
   
   out <- matrix(0, nr, nc)
   
-  # (루프지만 nr*nc가 90k 정도면 실무에서도 대체로 버팀)
   for (i in seq_len(nr)) {
     for (j in seq_len(nc)) {
       sub_m <- padded[i:(i + 2 * khr), j:(j + 2 * khc)]
@@ -209,14 +193,16 @@ conv2_same <- function(mat, kernel) {
 }
 
 # ---------------------------------------
-# [Helper 3] Robust Preprocess: Z-filter -> Smooth
+# [Helper 3] Preprocess: Z-filter -> Dual Smooth -> Saturating Mask
 #   - return: data.table(x, y, w)  (w >= 0)
 # ---------------------------------------
 preprocess_map_robust <- function(map_dt,
                                   sigma_thresh = 3.0,
                                   smooth_sigma = 1.0,
+                                  mask_gain = 2.0,
+                                  max_grid = 400000,
                                   tiny = 1e-12) {
-  # map_dt must have x,y,v
+  
   if (is.null(map_dt) || nrow(map_dt) == 0) {
     return(data.table::data.table(x = numeric(0), y = numeric(0), w = numeric(0)))
   }
@@ -226,71 +212,75 @@ preprocess_map_robust <- function(map_dt,
   dt0[, y := safe_as_numeric(y)]
   dt0[, v := safe_as_numeric(v)]
   
-  # 좌표 NA 제거
-  dt0 <- dt0[is.finite(x) & is.finite(y)]
+  # 좌표/값 유효성
+  dt0 <- dt0[is.finite(x) & is.finite(y) & is.finite(v)]
   if (nrow(dt0) == 0) {
     return(data.table::data.table(x = numeric(0), y = numeric(0), w = numeric(0)))
   }
   
-  # 혹시 중복좌표 있으면 평균으로 정리 (그룹 평균 맵 만든 뒤라도 안전빵)
+  # 중복좌표 평균
   dt0 <- dt0[, .(v = mean(v, na.rm = TRUE)), by = .(x, y)]
   
   vals <- dt0$v
-  mu <- mean(vals, na.rm = TRUE)
-  sdv <- stats::sd(vals, na.rm = TRUE)
+  mu   <- mean(vals, na.rm = TRUE)
+  sdv  <- stats::sd(vals, na.rm = TRUE)
   
-  # 예외: sd=0 or NA -> 전부 0 (shape 신호 없음)
+  # sd가 거의 0이면 신호 없음 처리
   if (!is.finite(sdv) || sdv < tiny) {
     dt0[, w := 0.0]
     return(dt0[, .(x, y, w)])
   }
   
-  # Z-score (NA 안전)
+  # Z-score
   z <- (vals - mu) / sdv
   z[!is.finite(z)] <- 0
   
-  # 에너지: abs(z) > thresh만 남김 (나머지 0)
-  if (!is.finite(sigma_thresh) || sigma_thresh <= 0) sigma_thresh <- 0
+  if (!is.finite(sigma_thresh) || sigma_thresh < 0) sigma_thresh <- 0
+  if (!is.finite(mask_gain) || mask_gain < 0) mask_gain <- 0
+  
+  # 에너지 필터
   w0 <- ifelse(abs(z) > sigma_thresh, abs(z), 0)
   
-  # smoothing
-  if (is.finite(smooth_sigma) && smooth_sigma > 0) {
-    # 좌표 범위 -> matrix
-    x_rng <- range(dt0$x, na.rm = TRUE)
-    y_rng <- range(dt0$y, na.rm = TRUE)
-    
-    # 정수 격자 가정 (실무에서 x,y가 정수인 경우)
-    # 혹시 실수면: 여기서 라운딩/빈닝이 필요할 수 있음 (현재는 그대로 씀)
-    xs <- sort(unique(dt0$x))
-    ys <- sort(unique(dt0$y))
-    
-    # 만약 x,y가 “연속 실수”로 들어오면 grid가 너무 커질 수 있음
-    # -> 그 경우는 03_calc에서 좌표를 binning(예: round/scale)해서 맵 만들기를 추천
-    if (length(xs) * length(ys) > 400000) {
-      # 너무 큰 grid 방어: smoothing skip
-      dt0[, w := w0]
-      return(dt0[, .(x, y, w)])
-    }
-    
-    # index map
-    x_to_c <- match(dt0$x, xs)
-    y_to_r <- match(dt0$y, ys)
-    
-    mat <- matrix(0, nrow = length(ys), ncol = length(xs))
-    mat[cbind(y_to_r, x_to_c)] <- w0
-    
-    kernel <- make_gaussian_kernel(smooth_sigma)
-    res_mat <- conv2_same(mat, kernel)
-    
-    w_sm <- res_mat[cbind(y_to_r, x_to_c)]
-    w_sm[!is.finite(w_sm)] <- 0
-    dt0[, w := as.numeric(w_sm)]
-  } else {
+  # 스무딩 비활성 옵션
+  if (!is.finite(smooth_sigma) || smooth_sigma <= 0) {
     dt0[, w := as.numeric(w0)]
+    dt0[w < 0, w := 0.0]
+    return(dt0[, .(x, y, w)])
   }
   
-  # 음수 방지(원래 없어야 함)
-  dt0[w < 0, w := 0.0]
+  # grid 구성
+  xs <- sort(unique(dt0$x))
+  ys <- sort(unique(dt0$y))
+  
+  if (length(xs) * length(ys) > max_grid) {
+    # grid 폭발 방지: smoothing 스킵
+    dt0[, w := as.numeric(w0)]
+    dt0[w < 0, w := 0.0]
+    return(dt0[, .(x, y, w)])
+  }
+  
+  x_to_c <- match(dt0$x, xs)
+  y_to_r <- match(dt0$y, ys)
+  
+  mat_w0 <- matrix(0, nrow = length(ys), ncol = length(xs))
+  mat_w0[cbind(y_to_r, x_to_c)] <- w0
+  
+  mat_mask <- (mat_w0 > 0) * 1.0
+  
+  kernel <- make_gaussian_kernel(smooth_sigma)
+  
+  # dual convolution
+  sm_mat <- conv2_same(mat_w0,   kernel)  # intensity
+  d_mat  <- conv2_same(mat_mask, kernel)  # density
+  
+  # saturating density attention
+  final_mat <- sm_mat * pmin(d_mat * mask_gain, 1.0)
+  
+  w_final <- as.numeric(final_mat[cbind(y_to_r, x_to_c)])
+  w_final[!is.finite(w_final)] <- 0
+  w_final[w_final < 0] <- 0
+  
+  dt0[, w := w_final]
   dt0[, .(x, y, w)]
 }
 
@@ -298,6 +288,7 @@ preprocess_map_robust <- function(map_dt,
 # [Helper 4] Normalize to probability
 # ---------------------------------------
 normalize_prob <- function(w, tiny = 1e-12) {
+  if (length(w) == 0) return(numeric(0))
   s <- sum(w, na.rm = TRUE)
   if (!is.finite(s) || s < tiny) return(rep(1 / length(w), length(w)))
   w / s
@@ -306,7 +297,7 @@ normalize_prob <- function(w, tiny = 1e-12) {
 # ---------------------------------------
 # [Helper 5] Sinkhorn cost for rectangular supports
 #   p: length n, q: length m, C: n x m
-#   return: scalar cost = sum_{i,j} gamma_ij * C_ij
+#   return: scalar cost
 # ---------------------------------------
 sinkhorn_cost_rect <- function(p, q, C,
                                epsilon = 0.1,
@@ -316,7 +307,6 @@ sinkhorn_cost_rect <- function(p, q, C,
   if (n == 0 || m == 0) return(NA_real_)
   if (!is.finite(epsilon) || epsilon <= 0) epsilon <- 0.1
   
-  # kernel
   K <- exp(-C / epsilon)
   K[!is.finite(K)] <- 0
   K[K < tiny] <- 0
@@ -324,7 +314,6 @@ sinkhorn_cost_rect <- function(p, q, C,
   u <- rep(1, n)
   v <- rep(1, m)
   
-  # iterations
   for (it in seq_len(max_iter)) {
     Kv <- as.numeric(K %*% v)
     Kv[Kv < tiny] <- tiny
@@ -335,22 +324,18 @@ sinkhorn_cost_rect <- function(p, q, C,
     v <- q / Ktu
   }
   
-  # cost = sum_{i,j} u_i K_ij v_j C_ij
-  #      = sum_i u_i * sum_j (K_ij * C_ij * v_j)
-  KCv <- as.numeric((K * C) %*% v)
+  KCv  <- as.numeric((K * C) %*% v)
   cost <- sum(u * KCv)
   as.numeric(cost)
 }
 
-
 # ---------------------------------------
-# [Main] spatial drift (robust preprocess + sinkhorn)
-#  - map_ref / map_target: data.table(x,y,v)
-#  - returns scalar distance
+# [Main] spatial drift (preprocess + sinkhorn)
 # ---------------------------------------
 calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
                                         sigma_thresh = 3.0,
                                         smooth_sigma = 1.0,
+                                        mask_gain = 2.0,
                                         epsilon = 0.1,
                                         max_iter = 80,
                                         cost_scale = NULL,
@@ -359,20 +344,25 @@ calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
   if (is.null(map_ref) || is.null(map_target)) return(NA_real_)
   if (nrow(map_ref) == 0 || nrow(map_target) == 0) return(NA_real_)
   
-  # Phase 1: robust preprocess
-  dt_r <- preprocess_map_robust(map_ref, sigma_thresh = sigma_thresh, smooth_sigma = smooth_sigma, tiny = tiny)
-  dt_t <- preprocess_map_robust(map_target, sigma_thresh = sigma_thresh, smooth_sigma = smooth_sigma, tiny = tiny)
+  # Phase 1: preprocess (dual conv + saturating mask)
+  dt_r <- preprocess_map_robust(map_ref,
+                                sigma_thresh = sigma_thresh,
+                                smooth_sigma = smooth_sigma,
+                                mask_gain    = mask_gain,
+                                tiny         = tiny)
+  
+  dt_t <- preprocess_map_robust(map_target,
+                                sigma_thresh = sigma_thresh,
+                                smooth_sigma = smooth_sigma,
+                                mask_gain    = mask_gain,
+                                tiny         = tiny)
   
   sr <- sum(dt_r$w, na.rm = TRUE)
   st <- sum(dt_t$w, na.rm = TRUE)
   
-  # 둘 다 신호 없으면 0
   if (sr < tiny && st < tiny) return(0.0)
-  
-  # 한쪽만 신호 있으면 penalty
   if (sr < tiny || st < tiny) return(as.numeric(empty_penalty))
   
-  # OT support를 nonzero만 (속도 핵심)
   dt_r2 <- dt_r[w > 0]
   dt_t2 <- dt_t[w > 0]
   
@@ -385,7 +375,7 @@ calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
   Xr <- dt_r2$x; Yr <- dt_r2$y
   Xt <- dt_t2$x; Yt <- dt_t2$y
   
-  # cost scaling (좌표 scale 안정화)
+  # cost scaling
   if (is.null(cost_scale)) {
     rx <- max(c(Xr, Xt), na.rm = TRUE) - min(c(Xr, Xt), na.rm = TRUE)
     ry <- max(c(Yr, Yt), na.rm = TRUE) - min(c(Yr, Yt), na.rm = TRUE)
@@ -401,8 +391,6 @@ calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
   
   sinkhorn_cost_rect(p, q, C, epsilon = epsilon, max_iter = max_iter, tiny = tiny)
 }
-
-
 
 # -------------------------------------------------------------------------
 # 5) Build result row (results.csv rev1 Final)

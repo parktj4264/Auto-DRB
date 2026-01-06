@@ -1,0 +1,988 @@
+# run.R
+library(here)
+
+# README --------------------------------------------------------------
+# /data
+#   ├ raw.csv      ← IH 추출 Chip 데이터 (칩 레벨)
+#   └ ROOTID.csv   ← ROOTID - GROUP 매핑 (웨이퍼 레벨)
+#
+# /output
+#   └ results.csv  ← DRB rev1 결과
+
+
+# parameter -----------------------------------------------------------
+# Only edit here!
+
+# --- input files ---
+FILE_NAME_RAW       <- "raw.csv"
+FILE_NAME_META      <- "ROOTID.csv"
+
+# --- group definition ---
+# 원칙: REF=기준(Old), TARGET=변경(New)
+GROUP_REF_LABEL     <- "A"
+GROUP_TARGET_LABEL  <- "B"
+
+
+ROOTID_COL <- "ROOTID"
+PARTID_COL <- "PARTID"
+GROUP_COL  <- "GROUP"
+X_COL <- "X"
+Y_COL <- "Y"
+
+# --- DRB rev1 parameters --------------------------------------------
+
+# 1) direction 판정용 threshold (k-sigma)
+# - sigma_score = (mean_target - mean_ref) / sd_ref
+# - direction: Up/Down/Stable을 나누는 기준
+SIGMA_LEVEL         <- 0.3          # 예: 0.3 / 0.5 / 1.0 / 1.5
+
+# 2) spatial_drift (Robust preprocess -> Smooth -> Sinkhorn OT)
+# Phase 1: Z-filter (abs(z) > thresh 만 에너지로 인정)
+OT_SIGMA_THRESH     <- 3.0
+# Phase 2: smoothing sigma (blob화)
+OT_SMOOTH_SIGMA     <- 1.0
+# Phase 3: Sinkhorn regularization + iterations
+OT_EPSILON          <- 0.10
+OT_MAX_ITER         <- 80
+# cost scaling (optional)
+OT_COST_SCALE       <- NULL  # NULL이면 내부에서 자동
+# empty case handling
+OT_EMPTY_PENALTY    <- 1.0   # 한쪽만 신호 있으면 penalty
+# numeric stability
+OT_TINY             <- 1e-12
+
+
+# --- output ---
+OUT_DIR             <- "output"
+OUT_FILE_RESULTS    <- "results.csv"
+
+# start ---------------------------------------------------------------
+source(here::here("main.R"), encoding = "UTF-8")
+
+
+
+
+
+
+
+
+
+
+# main.R -------------------------------------------------------------------
+
+# library load and setting --------------------------------------------
+library(here)
+source(here::here("src", "00_libraries.R"), encoding = "UTF-8")
+
+cat("==============================================\n")
+
+# time start -----------------------------------------------------------
+start_time <- Sys.time()
+
+# function & script load ----------------------------------------------
+source(here::here("src", "01_load.R"), encoding = "UTF-8")
+source(here::here("src", "02_funcs.R"), encoding = "UTF-8")
+source(here::here("src", "03_calc.R"), encoding = "UTF-8")
+source(here::here("src", "04_save.R"), encoding = "UTF-8")
+
+# time end -------------------------------------------------------------
+end_time <- Sys.time()
+elapsed  <- as.numeric(difftime(end_time, start_time, units = "secs"))
+mins     <- floor(elapsed / 60)
+secs     <- round(elapsed %% 60)
+
+cat(sprintf("\nElapsed time: %d min %d sec\n", mins, secs))
+cat("DRB rev1 done\n")
+cat("==============================================\n")
+
+
+
+
+
+
+
+# 패키지 자동 설치 및 로딩 함수 (무적 버전) -------------------------------------------------------
+library_load <- function(packages) {
+  
+  # [핵심] 옵션 강제 설정: 질문 금지, 바이너리 강제, 주소 지정
+  options(repos = c(CRAN = "https://cran.rstudio.com/"))  # 다운로드 주소 고정
+  options(pkgType = "win.binary")                         # 윈도우용 완제품만 (컴파일 X)
+  options(install.packages.check.source = "no")           # 소스 확인 안함
+  options(install.packages.compile.from.source = "never") # 컴파일 절대 안함 (에러 방지)
+  
+  # 색상 정의 (콘솔 로그 가독성 UP)
+  green  <- function(x) paste0("\033[32m", x, "\033[0m")
+  yellow <- function(x) paste0("\033[33m", x, "\033[0m")
+  blue   <- function(x) paste0("\033[34m", x, "\033[0m")
+  red    <- function(x) paste0("\033[31m", x, "\033[0m")
+  gray   <- function(x) paste0("\033[90m", x, "\033[0m")
+  
+  total <- length(packages)
+  
+  for (i in seq_along(packages)) {
+    package <- packages[i]
+    message(gray(strrep("-", 50)))
+    message(gray(paste0("Package [", i, "/", total, "]")))
+    
+    if (!requireNamespace(package, quietly = TRUE)) {
+      message(yellow(paste("Installing:", package, "(Binary Only)")))
+      
+      tryCatch({
+        # 여기서 type="binary" 한번 더 명시해서 확인사살
+        install.packages(package, type = "binary", quiet = TRUE)
+      }, error = function(e) {
+        message(red(paste("Install failed:", package)))
+        message(red(paste("Error:", e$message)))
+      })
+      
+    } else {
+      message(green(paste("Already installed:", package)))
+    }
+    
+    message(blue(paste("Loading:", package)))
+    suppressPackageStartupMessages(
+      library(package, character.only = TRUE)
+    )
+  }
+  
+  message(gray(strrep("-", 50)))
+  message(green("All requested packages processed."))
+}
+
+# 사용할 패키지 목록 --------------------------------------------------------------
+cat("library를 불러옵니다...\n")
+
+library_load(
+  c("data.table", "here", "stringr", "lubridate", "purrr", "stats", "dplyr")
+)
+
+
+
+# src/01_load.R ------------------------------------------------------------
+
+
+# 1. 파일 경로 설정 및 체크 -------------------------------------------------
+cat("Reading data...\n")
+
+path_raw  <- here::here("data", FILE_NAME_RAW)
+path_meta <- here::here("data", FILE_NAME_META)
+
+if (!file.exists(path_raw))  stop(paste("Raw Data 없음:", path_raw))
+if (!file.exists(path_meta)) stop(paste("Meta Data 없음:", path_meta))
+
+
+# 2. 데이터 로드 (Fast Read) ------------------------------------------------
+dt_raw  <- fread(path_raw,  header = TRUE, nThread = getDTthreads())
+dt_meta <- fread(path_meta, header = TRUE, nThread = getDTthreads())
+
+cat(sprintf("Raw Loaded : %s rows, %s cols\n", format(nrow(dt_raw), big.mark=","), ncol(dt_raw)))
+cat(sprintf("Meta Loaded: %s rows, %s cols\n", format(nrow(dt_meta), big.mark=","), ncol(dt_meta)))
+
+
+# 3. 필수 컬럼 유효성 체크 ----------------------------------------------------
+# raw 필수: ROOTID, PARTID
+req_raw  <- c(ROOTID_COL, PARTID_COL)
+miss_raw <- setdiff(req_raw, names(dt_raw))
+if (length(miss_raw) > 0) {
+  stop(sprintf("raw.csv에 필수 컬럼 없음: %s", paste(miss_raw, collapse = ", ")))
+}
+
+# meta 필수: ROOTID, GROUP
+req_meta  <- c(ROOTID_COL, GROUP_COL)
+miss_meta <- setdiff(req_meta, names(dt_meta))
+if (length(miss_meta) > 0) {
+  stop(sprintf("ROOTID.csv에 필수 컬럼 없음: %s", paste(miss_meta, collapse = ", ")))
+}
+
+
+# 4. MSR 컬럼 식별 (PARTID 이후 전부) ---------------------------------------
+cat(">> Identifying MSR columns based on 'PARTID'...\n")
+
+idx_partid <- which(names(dt_raw) == PARTID_COL)
+if (length(idx_partid) != 1) stop("raw.csv에서 PARTID 컬럼이 없거나(또는 중복)합니다.")
+
+idx_start <- idx_partid + 1
+if (idx_start > ncol(dt_raw)) stop("PARTID가 마지막 컬럼입니다. PARTID 뒤에 MSR 컬럼이 없습니다.")
+
+MSR_COLS <- names(dt_raw)[idx_start:ncol(dt_raw)]
+if (length(MSR_COLS) == 0) stop("MSR 컬럼이 0개입니다. (PARTID 뒤에 데이터 없음)")
+
+cat(sprintf("Target MSR Count: %d\n", length(MSR_COLS)))
+
+
+# 5. meta GROUP 값 체크 (REF/TARGET 존재 여부) ------------------------------
+# (원칙: run.R의 REF/TARGET를 존중하되, 불일치하면 ROOTID.csv 기준으로 자동 지정)
+dt_meta[, (GROUP_COL) := as.character(get(GROUP_COL))]
+
+u_groups <- sort(unique(dt_meta[[GROUP_COL]]))
+cat(sprintf(">> Meta GROUP levels: %s\n", paste(u_groups, collapse = ", ")))
+
+if (length(u_groups) < 2) {
+  stop(sprintf("Meta의 GROUP 유니크 값이 2개 미만입니다. (현재: %s)  REF/TARGET 비교 불가",
+               paste(u_groups, collapse=", ")))
+}
+
+# run.R 설정 라벨이 meta에 실제로 존재하는지 확인
+ok_ref    <- (GROUP_REF_LABEL    %in% u_groups)
+ok_target <- (GROUP_TARGET_LABEL %in% u_groups)
+
+if (!ok_ref || !ok_target) {
+  cat("WARNING: run.R의 REF/TARGET 라벨이 meta와 불일치합니다. ROOTID.csv 기준으로 REF/TARGET를 자동 지정합니다.\n")
+  cat(sprintf(" - run.R REF/TARGET : %s / %s\n", GROUP_REF_LABEL, GROUP_TARGET_LABEL))
+  
+  # 자동 지정 규칙: 정렬된 유니크 값의 1번=REF, 2번=TARGET
+  GROUP_REF_LABEL    <- u_groups[1]
+  GROUP_TARGET_LABEL <- u_groups[2]
+  
+  cat(sprintf(" - auto  REF/TARGET : %s / %s\n", GROUP_REF_LABEL, GROUP_TARGET_LABEL))
+}
+
+
+
+# 6. 데이터 병합 (Merge): raw에 GROUP 붙이기 --------------------------------
+cat(">> Merging raw + meta by ROOTID...\n")
+
+# merge 결과 컬럼 순서가 바뀔 수 있으니 MSR_COLS는 위에서 raw 기준으로 이미 확정!
+dt <- merge(dt_raw, dt_meta[, c(ROOTID_COL, GROUP_COL), with=FALSE],
+            by = ROOTID_COL, all.x = TRUE)
+
+# GROUP 누락 체크 (stop 대신 warning + 제외)
+n_na_group <- sum(is.na(dt[[GROUP_COL]]))
+if (n_na_group > 0) {
+  cat(sprintf("WARNING: Merge 후 GROUP이 NA인 row가 %s개 있습니다. 해당 row는 제외하고 진행합니다.\n",
+              format(n_na_group, big.mark=",")))
+  
+  # 어떤 ROOTID가 누락됐는지 샘플 표시
+  miss_ids <- unique(dt[is.na(get(GROUP_COL)), get(ROOTID_COL)])
+  cat(sprintf(" - 누락 ROOTID 예시: %s\n",
+              paste(head(miss_ids, 5), collapse=", ")))
+  
+  # 제외
+  dt <- dt[!is.na(get(GROUP_COL))]
+}
+
+
+# GROUP 타입 통일
+dt[, (GROUP_COL) := as.character(get(GROUP_COL))]
+
+
+# 7. MSR 컬럼 타입 정리 (numeric 강제) ---------------------------------------
+# 실무 데이터에서 MSR에 문자/공백 섞이는 사고 방지
+cat(">> Coercing MSR columns to numeric (safe)...\n")
+
+for (nm in MSR_COLS) {
+  if (!is.numeric(dt[[nm]])) {
+    suppressWarnings({
+      dt[, (nm) := as.numeric(get(nm))]
+    })
+  }
+}
+
+
+# 8. 완료 로그 --------------------------------------------------------------
+cat("Done (Merged)\n")
+cat(sprintf("Final Data: %s rows, %s cols\n", format(nrow(dt), big.mark=","), ncol(dt)))
+cat(sprintf("Group column: %s (REF=%s, TARGET=%s)\n", GROUP_COL, GROUP_REF_LABEL, GROUP_TARGET_LABEL))
+cat(sprintf("MSR range: %s ... %s\n", MSR_COLS[1], MSR_COLS[length(MSR_COLS)]))
+
+
+
+
+
+
+
+
+
+# 02_funcs.R
+# src/02_funcs.R ------------------------------------------------------------
+
+# 목적:
+# - 03_calc.R에서 MSR 루프를 돌릴 때 사용할 함수 모음
+# - REF/TARGET 비교 기준은 run.R의 GROUP_REF_LABEL / GROUP_TARGET_LABEL
+# - 결과는 results.csv (snake_case, ref/target 표기) 기준
+#
+# DRB rev1 (Final):
+# - sigma_score      : Glass's delta = (mean_target - mean_ref) / sd_ref
+# - cliffs_delta     : distribution dominance (Wilcoxon W -> U -> delta)
+# - spatial_drift    : Wasserstein Distance (Geometry / Optimal Transport)
+# - direction        : Up/Down/Stable (threshold = SIGMA_LEVEL)
+
+# -------------------------------------------------------------------------
+# 0) Small helpers
+# -------------------------------------------------------------------------
+
+safe_mean <- function(x) {
+  if (length(x) == 0) return(NA_real_)
+  mean(x, na.rm = TRUE)
+}
+
+safe_sd <- function(x) {
+  if (length(x) < 2) return(NA_real_)
+  stats::sd(x, na.rm = TRUE)
+}
+
+safe_median <- function(x) {
+  if (length(x) == 0) return(NA_real_)
+  stats::median(x, na.rm = TRUE)
+}
+
+safe_as_numeric <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
+}
+
+# 그룹 split (벡터 기반)
+split_ref_target <- function(x, g, ref_label, target_label) {
+  idx_ref    <- which(g == ref_label)
+  idx_target <- which(g == target_label)
+  
+  list(
+    x_ref    = x[idx_ref],
+    x_target = x[idx_target],
+    n_ref    = length(idx_ref),
+    n_target = length(idx_target)
+  )
+}
+
+# MAP Average Function
+make_group_mean_map <- function(dt, msr_col, group_col, group_label,
+                                x_col = "X", y_col = "Y") {
+  
+  # dt: 01_load.R 결과 (GROUP 붙어있어야 함)
+  # return: data.table(x, y, v)
+  
+  d0 <- dt[get(group_col) == group_label, .(
+    x = safe_as_numeric(get(x_col)),
+    y = safe_as_numeric(get(y_col)),
+    v = safe_as_numeric(get(msr_col))
+  )]
+  
+  d0 <- d0[is.finite(x) & is.finite(y) & is.finite(v)]
+  if (nrow(d0) == 0) return(data.table::data.table(x=numeric(0), y=numeric(0), v=numeric(0)))
+  
+  # "그룹 내 웨이퍼들"을 평균내서 대표 맵 생성
+  d0[, .(v = mean(v, na.rm = TRUE)), by = .(x, y)]
+}
+
+
+# -------------------------------------------------------------------------
+# 1) Summary stats (chip pooling)
+# -------------------------------------------------------------------------
+
+calc_summary_ref_target <- function(x_ref, x_target) {
+  mean_ref    <- safe_mean(x_ref)
+  sd_ref      <- safe_sd(x_ref)
+  mean_target <- safe_mean(x_target)
+  sd_target   <- safe_sd(x_target)
+  
+  mean_diff   <- mean_target - mean_ref
+  median_diff <- safe_median(x_target) - safe_median(x_ref)
+  
+  list(
+    mean_ref    = mean_ref,
+    sd_ref      = sd_ref,
+    mean_target = mean_target,
+    sd_target   = sd_target,
+    mean_diff   = mean_diff,
+    median_diff = median_diff
+  )
+}
+
+# -------------------------------------------------------------------------
+# 2) sigma_score (Glass's delta)
+#    score = (mean_target - mean_ref) / sd_ref
+# -------------------------------------------------------------------------
+
+calc_sigma_score <- function(mean_ref, sd_ref, mean_target) {
+  if (!is.finite(mean_ref) || !is.finite(mean_target) || !is.finite(sd_ref)) return(NA_real_)
+  if (sd_ref <= 0) return(NA_real_)
+  (mean_target - mean_ref) / sd_ref
+}
+
+direction_from_sigma <- function(sigma_score, sigma_level) {
+  # sigma_level = SIGMA_LEVEL (예: 0.5 / 1.0 / 1.5)
+  if (!is.finite(sigma_score) || !is.finite(sigma_level)) return("Stable")
+  if (sigma_score >= sigma_level) return("Up")
+  if (sigma_score <= -sigma_level) return("Down")
+  "Stable"
+}
+
+# -------------------------------------------------------------------------
+# 3) cliffs_delta (Stochastic Dominance)
+#    - Mann–Whitney U 기반 Cliff's delta (Target > Ref 우세면 +)
+#    - delta = 2U/(n_t*n_r) - 1
+#
+#    주의:
+#    - R의 wilcox.test(x, y)$statistic 은 이름이 "W"로 나오지만,
+#      2-sample에서는 R 내부 정의상 U(= rank-sum에서 m(m+1)/2 뺀 값)에 해당하는 형태로 반환됨.
+#    - 따라서 여기서는 추가로 m(m+1)/2를 빼지 않는다.
+#    - Target 우세를 +로 만들려면 wilcox.test(x_target, x_ref)로 호출.
+# -------------------------------------------------------------------------
+
+calc_cliffs_delta <- function(x_ref, x_target) {
+  xr <- suppressWarnings(as.numeric(x_ref))
+  xt <- suppressWarnings(as.numeric(x_target))
+  
+  xr <- xr[is.finite(xr)]
+  xt <- xt[is.finite(xt)]
+  
+  n_r <- length(xr)
+  n_t <- length(xt)
+  
+  if (n_r < 1 || n_t < 1) return(NA_real_)
+  
+  # R의 "W" (2-sample): 사실상 U 형태(shifted rank-sum)로 리턴되는 값
+  U <- tryCatch({
+    as.numeric(stats::wilcox.test(xt, xr, alternative = "two.sided", exact = FALSE)$statistic)
+  }, error = function(e) NA_real_)
+  
+  if (!is.finite(U)) return(NA_real_)
+  
+  denom <- n_t * n_r
+  if (denom <= 0) return(NA_real_)
+  
+  delta <- (2 * U / denom) - 1
+  as.numeric(delta)
+}
+
+# -------------------------------------------------------------------------
+# 4) spatial_drift (Robust preprocess -> Smooth -> Sinkhorn OT)
+#    - map_ref / map_target: data.table(x, y, v)
+#    - Output: scalar distance (shape drift)
+#
+# 핵심 아이디어:
+#  (1) Z-filter: abs(z) > sigma_thresh 만 에너지로 인정
+#  (2) Smooth: gaussian kernel convolution으로 blob화
+#  (3) OT: nonzero support만 추려 Sinkhorn distance 계산
+# -------------------------------------------------------------------------
+
+# --- Helper: safe numeric ---
+safe_as_numeric <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(x))
+}
+
+# ---------------------------------------
+# [Helper 1] Gaussian Kernel (2D)
+# ---------------------------------------
+make_gaussian_kernel <- function(sigma = 1.0) {
+  if (!is.finite(sigma) || sigma <= 0) return(matrix(1, 1, 1))
+  
+  k_size <- ceiling(3 * sigma) * 2 + 1  # 3-sigma rule
+  center <- (k_size + 1) / 2
+  
+  ii <- seq_len(k_size)
+  jj <- seq_len(k_size)
+  d2 <- (ii - center)^2
+  # outer로 벡터화
+  kernel <- exp(-(outer(d2, d2, "+")) / (2 * sigma^2))
+  kernel / sum(kernel)
+}
+
+# ---------------------------------------
+# [Helper 2] 2D Convolution (naive but ok for <= ~301x301)
+# ---------------------------------------
+conv2_same <- function(mat, kernel) {
+  nr <- nrow(mat); nc <- ncol(mat)
+  kr <- nrow(kernel); kc <- ncol(kernel)
+  khr <- floor(kr / 2); khc <- floor(kc / 2)
+  
+  # padding
+  padded <- matrix(0, nr + 2 * khr, nc + 2 * khc)
+  padded[(khr + 1):(nr + khr), (khc + 1):(nc + khc)] <- mat
+  
+  out <- matrix(0, nr, nc)
+  
+  # (루프지만 nr*nc가 90k 정도면 실무에서도 대체로 버팀)
+  for (i in seq_len(nr)) {
+    for (j in seq_len(nc)) {
+      sub_m <- padded[i:(i + 2 * khr), j:(j + 2 * khc)]
+      out[i, j] <- sum(sub_m * kernel)
+    }
+  }
+  out
+}
+
+# ---------------------------------------
+# [Helper 3] Robust Preprocess: Z-filter -> Smooth
+#   - return: data.table(x, y, w)  (w >= 0)
+# ---------------------------------------
+preprocess_map_robust <- function(map_dt,
+                                  sigma_thresh = 3.0,
+                                  smooth_sigma = 1.0,
+                                  tiny = 1e-12) {
+  # map_dt must have x,y,v
+  if (is.null(map_dt) || nrow(map_dt) == 0) {
+    return(data.table::data.table(x = numeric(0), y = numeric(0), w = numeric(0)))
+  }
+  
+  dt0 <- data.table::as.data.table(map_dt)[, .(x, y, v)]
+  dt0[, x := safe_as_numeric(x)]
+  dt0[, y := safe_as_numeric(y)]
+  dt0[, v := safe_as_numeric(v)]
+  
+  # 좌표 NA 제거
+  dt0 <- dt0[is.finite(x) & is.finite(y)]
+  if (nrow(dt0) == 0) {
+    return(data.table::data.table(x = numeric(0), y = numeric(0), w = numeric(0)))
+  }
+  
+  # 혹시 중복좌표 있으면 평균으로 정리 (그룹 평균 맵 만든 뒤라도 안전빵)
+  dt0 <- dt0[, .(v = mean(v, na.rm = TRUE)), by = .(x, y)]
+  
+  vals <- dt0$v
+  mu <- mean(vals, na.rm = TRUE)
+  sdv <- stats::sd(vals, na.rm = TRUE)
+  
+  # 예외: sd=0 or NA -> 전부 0 (shape 신호 없음)
+  if (!is.finite(sdv) || sdv < tiny) {
+    dt0[, w := 0.0]
+    return(dt0[, .(x, y, w)])
+  }
+  
+  # Z-score (NA 안전)
+  z <- (vals - mu) / sdv
+  z[!is.finite(z)] <- 0
+  
+  # 에너지: abs(z) > thresh만 남김 (나머지 0)
+  if (!is.finite(sigma_thresh) || sigma_thresh <= 0) sigma_thresh <- 0
+  w0 <- ifelse(abs(z) > sigma_thresh, abs(z), 0)
+  
+  # smoothing
+  if (is.finite(smooth_sigma) && smooth_sigma > 0) {
+    # 좌표 범위 -> matrix
+    x_rng <- range(dt0$x, na.rm = TRUE)
+    y_rng <- range(dt0$y, na.rm = TRUE)
+    
+    # 정수 격자 가정 (실무에서 x,y가 정수인 경우)
+    # 혹시 실수면: 여기서 라운딩/빈닝이 필요할 수 있음 (현재는 그대로 씀)
+    xs <- sort(unique(dt0$x))
+    ys <- sort(unique(dt0$y))
+    
+    # 만약 x,y가 “연속 실수”로 들어오면 grid가 너무 커질 수 있음
+    # -> 그 경우는 03_calc에서 좌표를 binning(예: round/scale)해서 맵 만들기를 추천
+    if (length(xs) * length(ys) > 400000) {
+      # 너무 큰 grid 방어: smoothing skip
+      dt0[, w := w0]
+      return(dt0[, .(x, y, w)])
+    }
+    
+    # index map
+    x_to_c <- match(dt0$x, xs)
+    y_to_r <- match(dt0$y, ys)
+    
+    mat <- matrix(0, nrow = length(ys), ncol = length(xs))
+    mat[cbind(y_to_r, x_to_c)] <- w0
+    
+    kernel <- make_gaussian_kernel(smooth_sigma)
+    res_mat <- conv2_same(mat, kernel)
+    
+    w_sm <- res_mat[cbind(y_to_r, x_to_c)]
+    w_sm[!is.finite(w_sm)] <- 0
+    dt0[, w := as.numeric(w_sm)]
+  } else {
+    dt0[, w := as.numeric(w0)]
+  }
+  
+  # 음수 방지(원래 없어야 함)
+  dt0[w < 0, w := 0.0]
+  dt0[, .(x, y, w)]
+}
+
+# ---------------------------------------
+# [Helper 4] Normalize to probability
+# ---------------------------------------
+normalize_prob <- function(w, tiny = 1e-12) {
+  s <- sum(w, na.rm = TRUE)
+  if (!is.finite(s) || s < tiny) return(rep(1 / length(w), length(w)))
+  w / s
+}
+
+# ---------------------------------------
+# [Helper 5] Sinkhorn cost for rectangular supports
+#   p: length n, q: length m, C: n x m
+#   return: scalar cost = sum_{i,j} gamma_ij * C_ij
+# ---------------------------------------
+sinkhorn_cost_rect <- function(p, q, C,
+                               epsilon = 0.1,
+                               max_iter = 80,
+                               tiny = 1e-12) {
+  n <- length(p); m <- length(q)
+  if (n == 0 || m == 0) return(NA_real_)
+  if (!is.finite(epsilon) || epsilon <= 0) epsilon <- 0.1
+  
+  # kernel
+  K <- exp(-C / epsilon)
+  K[!is.finite(K)] <- 0
+  K[K < tiny] <- 0
+  
+  u <- rep(1, n)
+  v <- rep(1, m)
+  
+  # iterations
+  for (it in seq_len(max_iter)) {
+    Kv <- as.numeric(K %*% v)
+    Kv[Kv < tiny] <- tiny
+    u <- p / Kv
+    
+    Ktu <- as.numeric(t(K) %*% u)
+    Ktu[Ktu < tiny] <- tiny
+    v <- q / Ktu
+  }
+  
+  # cost = sum_{i,j} u_i K_ij v_j C_ij
+  #      = sum_i u_i * sum_j (K_ij * C_ij * v_j)
+  KCv <- as.numeric((K * C) %*% v)
+  cost <- sum(u * KCv)
+  as.numeric(cost)
+}
+
+
+# ---------------------------------------
+# [Main] spatial drift (robust preprocess + sinkhorn)
+#  - map_ref / map_target: data.table(x,y,v)
+#  - returns scalar distance
+# ---------------------------------------
+calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
+                                        sigma_thresh = 3.0,
+                                        smooth_sigma = 1.0,
+                                        epsilon = 0.1,
+                                        max_iter = 80,
+                                        cost_scale = NULL,
+                                        empty_penalty = 1.0,
+                                        tiny = 1e-12) {
+  if (is.null(map_ref) || is.null(map_target)) return(NA_real_)
+  if (nrow(map_ref) == 0 || nrow(map_target) == 0) return(NA_real_)
+  
+  # Phase 1: robust preprocess
+  dt_r <- preprocess_map_robust(map_ref, sigma_thresh = sigma_thresh, smooth_sigma = smooth_sigma, tiny = tiny)
+  dt_t <- preprocess_map_robust(map_target, sigma_thresh = sigma_thresh, smooth_sigma = smooth_sigma, tiny = tiny)
+  
+  sr <- sum(dt_r$w, na.rm = TRUE)
+  st <- sum(dt_t$w, na.rm = TRUE)
+  
+  # 둘 다 신호 없으면 0
+  if (sr < tiny && st < tiny) return(0.0)
+  
+  # 한쪽만 신호 있으면 penalty
+  if (sr < tiny || st < tiny) return(as.numeric(empty_penalty))
+  
+  # OT support를 nonzero만 (속도 핵심)
+  dt_r2 <- dt_r[w > 0]
+  dt_t2 <- dt_t[w > 0]
+  
+  if (nrow(dt_r2) == 0 && nrow(dt_t2) == 0) return(0.0)
+  if (nrow(dt_r2) == 0 || nrow(dt_t2) == 0) return(as.numeric(empty_penalty))
+  
+  p <- normalize_prob(dt_r2$w, tiny = tiny)
+  q <- normalize_prob(dt_t2$w, tiny = tiny)
+  
+  Xr <- dt_r2$x; Yr <- dt_r2$y
+  Xt <- dt_t2$x; Yt <- dt_t2$y
+  
+  # cost scaling (좌표 scale 안정화)
+  if (is.null(cost_scale)) {
+    rx <- max(c(Xr, Xt), na.rm = TRUE) - min(c(Xr, Xt), na.rm = TRUE)
+    ry <- max(c(Yr, Yt), na.rm = TRUE) - min(c(Yr, Yt), na.rm = TRUE)
+    cost_scale <- max(rx, ry)
+    if (!is.finite(cost_scale) || cost_scale < tiny) cost_scale <- 1
+  } else {
+    if (!is.finite(cost_scale) || cost_scale < tiny) cost_scale <- 1
+  }
+  
+  dx <- outer(Xr, Xt, "-") / cost_scale
+  dy <- outer(Yr, Yt, "-") / cost_scale
+  C  <- dx * dx + dy * dy
+  
+  sinkhorn_cost_rect(p, q, C, epsilon = epsilon, max_iter = max_iter, tiny = tiny)
+}
+
+
+
+# -------------------------------------------------------------------------
+# 5) Build result row (results.csv rev1 Final)
+# -------------------------------------------------------------------------
+
+make_result_row <- function(msr_name,
+                            direction,
+                            sigma_score,
+                            cliffs_delta,
+                            spatial_drift,
+                            mean_ref, sd_ref, mean_target, sd_target) {
+  
+  data.table::data.table(
+    msr           = as.character(msr_name),
+    direction     = as.character(direction),
+    sigma_score   = as.numeric(sigma_score),
+    cliffs_delta  = as.numeric(cliffs_delta),
+    spatial_drift = as.numeric(spatial_drift),
+    mean_ref      = as.numeric(mean_ref),
+    sd_ref        = as.numeric(sd_ref),
+    mean_target   = as.numeric(mean_target),
+    sd_target     = as.numeric(sd_target)
+  )
+}
+
+
+
+
+# 03_calc.R
+# src/03_calc.R ------------------------------------------------------------
+
+cat("Calculating results (chip pooling)...\n")
+
+# 0) 기본 체크 ---------------------------------------------------------------
+if (!exists("dt")) stop("dt가 없습니다. 01_load.R 실행 여부를 확인하세요.")
+if (!exists("MSR_COLS") || length(MSR_COLS) == 0) stop("MSR_COLS가 없습니다. 01_load.R의 MSR 식별을 확인하세요.")
+
+# 필수 컬럼 존재 체크 (경고 수준으로 최대한 유연하게)
+# NOTE: rev1 최종은 Radius 강제 아님 (spatial_drift는 X/Y 필요)
+need_cols <- c(ROOTID_COL, GROUP_COL, PARTID_COL)
+miss_cols <- setdiff(need_cols, names(dt))
+if (length(miss_cols) > 0) {
+  stop(sprintf("dt에 필수 컬럼이 없습니다: %s", paste(miss_cols, collapse=", ")))
+}
+
+# OT spatial_drift는 X/Y가 필요 (없으면 spatial_drift만 NA로 처리)
+has_xy <- all(c(X_COL, Y_COL) %in% names(dt))
+if (!has_xy) {
+  cat("WARNING: dt에 X/Y 컬럼이 없습니다. spatial_drift는 NA로 저장됩니다.\n")
+}
+
+# REF/TARGET 라벨 체크 (유연: 없으면 경고 후 가능한 만큼)
+u_groups_dt <- sort(unique(as.character(dt[[GROUP_COL]])))
+if (!(GROUP_REF_LABEL %in% u_groups_dt) || !(GROUP_TARGET_LABEL %in% u_groups_dt)) {
+  cat("WARNING: dt의 GROUP 값에 REF/TARGET 라벨이 완전히 존재하지 않습니다.\n")
+  cat(sprintf(" - dt GROUP levels: %s\n", paste(u_groups_dt, collapse=", ")))
+  cat(sprintf(" - REF/TARGET: %s / %s\n", GROUP_REF_LABEL, GROUP_TARGET_LABEL))
+  cat("가능한 범위에서 계산을 시도합니다. (표본 부족 시 score는 NA 처리)\n")
+}
+
+# 1) 루프 준비 ---------------------------------------------------------------
+n_msr <- length(MSR_COLS)
+cat(sprintf(">> MSR count = %d\n", n_msr))
+
+# 진행바
+pb <- utils::txtProgressBar(min = 0, max = n_msr, style = 3)
+
+# 결과 저장 (리스트로 모아 rbindlist)
+res_list <- vector("list", n_msr)
+
+# 미리 뽑아두는 벡터 (속도)
+g_all <- as.character(dt[[GROUP_COL]])
+
+# 그룹 인덱스는 루프 밖에서 한 번만 (속도 + 일관성)
+idx_ref    <- which(g_all == GROUP_REF_LABEL)
+idx_target <- which(g_all == GROUP_TARGET_LABEL)
+
+# OT spatial_drift 파라미터 (run.R에서 정의)
+if (!exists("OT_SIGMA_THRESH"))  OT_SIGMA_THRESH  <- 3.0
+if (!exists("OT_SMOOTH_SIGMA"))  OT_SMOOTH_SIGMA  <- 1.0
+if (!exists("OT_EPSILON"))       OT_EPSILON       <- 0.1
+if (!exists("OT_MAX_ITER"))      OT_MAX_ITER      <- 80
+if (!exists("OT_COST_SCALE"))    OT_COST_SCALE    <- NULL
+if (!exists("OT_EMPTY_PENALTY")) OT_EMPTY_PENALTY <- 1.0
+if (!exists("OT_TINY"))          OT_TINY          <- 1e-12
+
+# 2) MSR loop ----------------------------------------------------------------
+for (i in seq_len(n_msr)) {
+  
+  msr <- MSR_COLS[i]
+  
+  # MSR 벡터
+  x_all <- dt[[msr]]
+  
+  # REF/TARGET split (칩 풀링)
+  sp <- split_ref_target(
+    x = x_all,
+    g = g_all,
+    ref_label = GROUP_REF_LABEL,
+    target_label = GROUP_TARGET_LABEL
+  )
+  
+  x_ref    <- sp$x_ref
+  x_target <- sp$x_target
+  
+  # 요약통계
+  summ <- calc_summary_ref_target(x_ref, x_target)
+  
+  # sigma_score (Glass's delta)
+  sigma_score <- calc_sigma_score(
+    mean_ref    = summ$mean_ref,
+    sd_ref      = summ$sd_ref,
+    mean_target = summ$mean_target
+  )
+  
+  # direction (Up/Down/Stable) : threshold = SIGMA_LEVEL
+  direction <- direction_from_sigma(
+    sigma_score  = sigma_score,
+    sigma_level  = SIGMA_LEVEL
+  )
+  
+  # cliffs_delta (distribution dominance)
+  cliffs_delta <- calc_cliffs_delta(
+    x_ref    = x_ref,
+    x_target = x_target
+  )
+  
+  # spatial_drift (Sinkhorn OT on GROUP-averaged wafer maps)
+  spatial_drift <- NA_real_
+  if (has_xy && length(idx_ref) > 0 && length(idx_target) > 0) {
+    
+    # 그룹별 좌표-평균 맵 생성 (칩 좌표별 평균)
+    # - 반드시 (x,y)별 평균 v를 만들어서 "그룹 평균 웨이퍼맵"을 만든다
+    map_ref <- make_group_mean_map(
+      dt          = dt,
+      msr_col     = msr,
+      group_col   = GROUP_COL,
+      group_label = GROUP_REF_LABEL,
+      x_col       = X_COL,
+      y_col       = Y_COL
+    )
+    
+    map_target <- make_group_mean_map(
+      dt          = dt,
+      msr_col     = msr,
+      group_col   = GROUP_COL,
+      group_label = GROUP_TARGET_LABEL,
+      x_col       = X_COL,
+      y_col       = Y_COL
+    )
+    
+    # Z-filter + smoothing + Sinkhorn OT
+    spatial_drift <- calc_spatial_drift_sinkhorn(
+      map_ref       = map_ref,
+      map_target    = map_target,
+      sigma_thresh  = OT_SIGMA_THRESH,
+      smooth_sigma  = OT_SMOOTH_SIGMA,
+      epsilon       = OT_EPSILON,
+      max_iter      = OT_MAX_ITER,
+      cost_scale    = OT_COST_SCALE,
+      empty_penalty = OT_EMPTY_PENALTY,
+      tiny          = OT_TINY
+    )
+  }
+  
+  # 결과 row 생성 (Final schema)
+  res_list[[i]] <- make_result_row(
+    msr_name      = msr,
+    direction     = direction,
+    sigma_score   = sigma_score,
+    cliffs_delta  = cliffs_delta,
+    spatial_drift = spatial_drift,
+    mean_ref      = summ$mean_ref,
+    sd_ref        = summ$sd_ref,
+    mean_target   = summ$mean_target,
+    sd_target     = summ$sd_target
+  )
+  
+  # progress update
+  utils::setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+# 3) 결과 합치기 --------------------------------------------------------------
+results_dt <- data.table::rbindlist(res_list, use.names = TRUE, fill = TRUE)
+
+# 4) 정렬 (권장: abs(sigma_score) 내림차순) -----------------------------------
+# - NA는 뒤로
+if ("sigma_score" %in% names(results_dt)) {
+  ord <- order(is.na(results_dt$sigma_score), -abs(results_dt$sigma_score))
+  results_dt <- results_dt[ord]
+}
+
+cat("Done (Calc)\n")
+cat(sprintf("Results: %s rows, %s cols\n",
+            format(nrow(results_dt), big.mark=","), ncol(results_dt)))
+
+# quick summary
+if (all(c("direction") %in% names(results_dt))) {
+  tab_dir <- table(results_dt$direction, useNA = "ifany")
+  cat("Direction summary:\n")
+  print(tab_dir)
+}
+
+
+
+
+# 04_save.R
+# src/04_save.R ------------------------------------------------------------
+
+cat("Saving outputs...\n")
+
+# 1) 결과 객체 체크 ----------------------------------------------------------
+if (!exists("results_dt")) {
+  cat("WARNING: results_dt가 없습니다. 저장을 스킵합니다.\n")
+} else {
+  
+  # 2) output dir 준비 ------------------------------------------------------
+  out_dir <- here::here(OUT_DIR)
+  if (!dir.exists(out_dir)) {
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+    cat(sprintf(">> Created output dir: %s\n", out_dir))
+  }
+  
+  # 3) 파일 저장 ------------------------------------------------------------
+  out_path <- file.path(out_dir, OUT_FILE_RESULTS)
+  
+  # overwrite 안내 (실무에서 중요)
+  if (file.exists(out_path)) {
+    cat(sprintf("WARNING: existing file will be overwritten: %s\n", out_path))
+  }
+  
+  # [OPTIONAL] direction을 코드로도 남기고 싶으면 추가 (Up=1, Stable=0, Down=-1)
+  # - 기본은 direction 문자열 유지 (엔지니어 가독성)
+  if ("direction" %in% names(results_dt) && !("dir_code" %in% names(results_dt))) {
+    results_dt[, dir_code := fifelse(direction == "Up", 1L,
+                                     fifelse(direction == "Down", -1L, 0L))]
+  }
+  
+  # fwrite (빠르고 안전)
+  tryCatch({
+    data.table::fwrite(results_dt, out_path)
+    cat(sprintf(">> Saved: %s\n", out_path))
+  }, error = function(e) {
+    cat("ERROR: fwrite failed.\n")
+    cat(sprintf(" - message: %s\n", e$message))
+  })
+  
+  # 4) 간단 요약 로그 -------------------------------------------------------
+  cat(sprintf(">> rows: %s | cols: %d\n",
+              format(nrow(results_dt), big.mark=","), ncol(results_dt)))
+  
+  # direction 요약
+  if ("direction" %in% names(results_dt)) {
+    cat(">> direction summary:\n")
+    print(table(results_dt$direction, useNA = "ifany"))
+  }
+  
+  # # score 요약 (엔지니어가 바로 감 잡음)
+  # score_cols <- intersect(c("sigma_score", "cliffs_delta", "ws_spatial"), names(results_dt))
+  # if (length(score_cols) > 0) {
+  #   cat(">> score summary (quantiles):\n")
+  #   for (sc in score_cols) {
+  #     v <- results_dt[[sc]]
+  #     v <- v[is.finite(v)]
+  #     if (length(v) == 0) next
+  #     qs <- stats::quantile(v, probs = c(0, 0.25, 0.5, 0.75, 0.95, 1), na.rm = TRUE)
+  #     cat(sprintf(" - %s: ", sc))
+  #     print(qs)
+  #   }
+  # }
+  
+  # TOP10 예시 출력 (abs(sigma_score) 기준으로 이미 정렬돼있다는 가정)
+  # if ("sigma_score" %in% names(results_dt)) {
+  #   cat(">> TOP 10 by |sigma_score| (preview):\n")
+  #   cols_show <- intersect(c("msr","direction","sigma_score","cliffs_delta","ws_spatial",
+  #                            "mean_ref","sd_ref","mean_target","sd_target"), names(results_dt))
+  #   print(head(results_dt[, ..cols_show], 10))
+  # }
+}
+
+cat("Done (Save)\n")
+
+
+___
+
+지금 전체 코드는 이렇게 되어있는데 내가 방금 spatial_OT를 새롭게 재정립해서 이것만 쏙! 바꿀거야!! ㄱㄷ

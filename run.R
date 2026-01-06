@@ -46,10 +46,12 @@ SIGMA_LEVEL         <- 0.3          # 예: 0.3 / 0.5 / 1.0 / 1.5
 
 # 2) spatial_drift (Robust preprocess -> Smooth -> Sinkhorn OT)
 # Phase 1: Z-filter (abs(z) > thresh 만 에너지로 인정)
-OT_SIGMA_THRESH     <- 3.0
+OT_SIGMA_THRESH     <- 1.0
 # Phase 2: smoothing sigma (blob화)
-OT_SMOOTH_SIGMA     <- 1.0
-# Phase 3: Sinkhorn regularization + iterations
+OT_SMOOTH_SIGMA     <- 1.5
+# Phase 3: density saturation gain (cluster 강조)
+OT_MASK_GAIN        <- 2.0   # 예: 1.5 ~ 5.0 (클수록 군집 강조, 고립 노이즈 억제)
+# Sinkhorn regularization + iterations
 OT_EPSILON          <- 0.10
 OT_MAX_ITER         <- 80
 # cost scaling (optional)
