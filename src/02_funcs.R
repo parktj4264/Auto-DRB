@@ -366,6 +366,14 @@ calc_spatial_drift_sinkhorn <- function(map_ref, map_target,
   dt_r2 <- dt_r[w > 0]
   dt_t2 <- dt_t[w > 0]
   
+  
+  # 근사의 경우 추가
+  # K <- 120  # 예: 80~200 사이에서 튜닝 (속도/정확도 trade-off)
+  # 
+  # if (nrow(dt_r2) > K) dt_r2 <- dt_r2[order(-w)][1:K]
+  # if (nrow(dt_t2) > K) dt_t2 <- dt_t2[order(-w)][1:K]
+   
+  
   if (nrow(dt_r2) == 0 && nrow(dt_t2) == 0) return(0.0)
   if (nrow(dt_r2) == 0 || nrow(dt_t2) == 0) return(as.numeric(empty_penalty))
   
