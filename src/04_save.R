@@ -31,6 +31,23 @@ if (!exists("results_dt")) {
     )]
   }
 
+  # [NEW] Dynamic Column Naming (REF/TARGET)
+  # mean_ref -> mean_<GROUP_REF_LABEL>, etc.
+  if (exists("GROUP_REF_LABEL") && exists("GROUP_TARGET_LABEL")) {
+    # REF
+    old_ref <- c("mean_ref", "sd_ref")
+    new_ref <- c(paste0("mean_", GROUP_REF_LABEL), paste0("sd_", GROUP_REF_LABEL))
+
+    # TARGET
+    old_target <- c("mean_target", "sd_target")
+    new_target <- c(paste0("mean_", GROUP_TARGET_LABEL), paste0("sd_", GROUP_TARGET_LABEL))
+
+    # Rename if columns exist
+    data.table::setnames(results_dt, old_ref, new_ref, skip_absent = TRUE)
+    data.table::setnames(results_dt, old_target, new_target, skip_absent = TRUE)
+
+  }
+
   # (A) Main Save (Overwrite)
   tryCatch(
     {
