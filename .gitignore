@@ -24,3 +24,6 @@ raw.csv
 
 # Log files (keep folder, ignore txt)
 log/*.txt
+
+# Output files (ignore all)
+output/
