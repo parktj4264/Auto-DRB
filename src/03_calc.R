@@ -106,67 +106,87 @@ if (!exists("N_CORES")) N_CORES <- 1
 
 # --- Worker Function ---
 calc_msr_single <- function(msr) {
-  # 1. Base Stats
-  x_all <- dt[[msr]]
+  tryCatch(
+    {
+      # 1. Base Stats
+      x_all <- dt[[msr]]
 
-  sp <- split_ref_target(
-    x = x_all,
-    g = g_all,
-    ref_label = GROUP_REF_LABEL,
-    target_label = GROUP_TARGET_LABEL
-  )
+      sp <- split_ref_target(
+        x = x_all,
+        g = g_all,
+        ref_label = GROUP_REF_LABEL,
+        target_label = GROUP_TARGET_LABEL
+      )
 
-  x_ref <- sp$x_ref
-  x_target <- sp$x_target
+      x_ref <- sp$x_ref
+      x_target <- sp$x_target
 
-  # 요약통계
-  summ <- calc_summary_ref_target(x_ref, x_target)
+      # 요약통계
+      summ <- calc_summary_ref_target(x_ref, x_target)
 
-  # sigma_score
-  sigma_score <- calc_sigma_score(
-    mean_ref    = summ$mean_ref,
-    sd_ref      = summ$sd_ref,
-    mean_target = summ$mean_target
-  )
+      # sigma_score
+      sigma_score <- calc_sigma_score(
+        mean_ref    = summ$mean_ref,
+        sd_ref      = summ$sd_ref,
+        mean_target = summ$mean_target
+      )
 
-  direction <- direction_from_sigma(
-    sigma_score = sigma_score,
-    sigma_level = SIGMA_LEVEL
-  )
+      direction <- direction_from_sigma(
+        sigma_score = sigma_score,
+        sigma_level = SIGMA_LEVEL
+      )
 
-  cliffs_delta <- calc_cliffs_delta(x_ref, x_target)
+      cliffs_delta <- calc_cliffs_delta(x_ref, x_target)
 
-  # spatial_drift
-  spatial_drift <- NA_real_
-  if (!is.null(dtA_map) && !is.null(dtB_map) && nrow(dtA_map) > 0 && nrow(dtB_map) > 0) {
-    map_ref <- get_map_from_precomputed(dtA_map, msr)
-    map_target <- get_map_from_precomputed(dtB_map, msr)
+      # spatial_drift
+      spatial_drift <- NA_real_
+      if (!is.null(dtA_map) && !is.null(dtB_map) && nrow(dtA_map) > 0 && nrow(dtB_map) > 0) {
+        map_ref <- get_map_from_precomputed(dtA_map, msr)
+        map_target <- get_map_from_precomputed(dtB_map, msr)
 
-    spatial_drift <- calc_spatial_drift_sinkhorn(
-      map_ref       = map_ref,
-      map_target    = map_target,
-      sigma_thresh  = OT_SIGMA_THRESH,
-      smooth_sigma  = OT_SMOOTH_SIGMA,
-      mask_gain     = OT_MASK_GAIN,
-      epsilon       = OT_EPSILON,
-      max_iter      = OT_MAX_ITER,
-      cost_scale    = OT_COST_SCALE,
-      empty_penalty = OT_EMPTY_PENALTY,
-      tiny          = OT_TINY
-    )
-  }
+        spatial_drift <- calc_spatial_drift_sinkhorn(
+          map_ref       = map_ref,
+          map_target    = map_target,
+          sigma_thresh  = OT_SIGMA_THRESH,
+          smooth_sigma  = OT_SMOOTH_SIGMA,
+          mask_gain     = OT_MASK_GAIN,
+          epsilon       = OT_EPSILON,
+          max_iter      = OT_MAX_ITER,
+          cost_scale    = OT_COST_SCALE,
+          empty_penalty = OT_EMPTY_PENALTY,
+          tiny          = OT_TINY
+        )
+      }
 
-  # Return Row
-  make_result_row(
-    msr_name      = msr,
-    direction     = direction,
-    sigma_score   = sigma_score,
-    cliffs_delta  = cliffs_delta,
-    spatial_drift = spatial_drift,
-    mean_ref      = summ$mean_ref,
-    sd_ref        = summ$sd_ref,
-    mean_target   = summ$mean_target,
-    sd_target     = summ$sd_target
+      # Return Row
+      make_result_row(
+        msr_name      = msr,
+        direction     = direction,
+        sigma_score   = sigma_score,
+        cliffs_delta  = cliffs_delta,
+        spatial_drift = spatial_drift,
+        mean_ref      = summ$mean_ref,
+        sd_ref        = summ$sd_ref,
+        mean_target   = summ$mean_target,
+        sd_target     = summ$sd_target
+      )
+    },
+    error = function(e) {
+      # Error Handling: Return NA row with warning
+      # cat(sprintf("\n[ERROR] MSR: %s -> %s\n", msr, e$message)) # Parallel에서 cat은 잘 안보일 수 있음
+
+      make_result_row(
+        msr_name      = msr,
+        direction     = "Error",
+        sigma_score   = NA_real_,
+        cliffs_delta  = NA_real_,
+        spatial_drift = NA_real_,
+        mean_ref      = NA_real_,
+        sd_ref        = NA_real_,
+        mean_target   = NA_real_,
+        sd_target     = NA_real_
+      )
+    }
   )
 }
 

@@ -21,3 +21,6 @@ renv/staging/
 # project 추가
 raw.csv
 /data_before/
+
+# Log files (keep folder, ignore txt)
+log/*.txt
